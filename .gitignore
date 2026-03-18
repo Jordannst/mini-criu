@@ -1,0 +1,7 @@
+mini-criu
+*.o
+*.out
+*.dump
+*.log
+/build/
+/checkpoints/
