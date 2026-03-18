@@ -117,7 +117,7 @@ mini-criu> restore checkpoints/checkpoint-pid-12345-YYYYMMDD-HHMMSS
 mini-criu> exit
 ```
 
-Saat ini command `freeze` membuka snapshot, mengambil register CPU, menulis `regs.dump`, lalu menahan target tetap berhenti selama sesi CLI yang sama. Command `dump-memory` melanjutkan snapshot aktif tersebut, mem-parse `/proc/<pid>/maps`, membaca byte mentah dari region memori terpilih, menulis `mem.meta` dan `mem.dump`, lalu melepaskan target kembali. Command `restore` sekarang dapat memuat checkpoint yang sudah ada, memvalidasi file utama, membaca metadata/register, dan membuat kerangka target restore sementara tanpa mengeksekusi restore penuh.
+Saat ini command `freeze` membuka snapshot, mengambil register CPU, menulis `regs.dump`, lalu menahan target tetap berhenti selama sesi CLI yang sama. Command `dump-memory` melanjutkan snapshot aktif tersebut, mem-parse `/proc/<pid>/maps`, membaca byte mentah dari region memori terpilih, menulis `mem.meta` dan `mem.dump`, lalu melepaskan target kembali. Command `restore` sekarang dapat memuat checkpoint yang sudah ada, memvalidasi file utama, membaca metadata/register, membuat kerangka target restore sementara, dan mencoba menerapkan state register checkpoint tanpa mengeksekusi restore penuh.
 
 ## Batasan Utama
 
