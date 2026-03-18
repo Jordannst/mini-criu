@@ -110,7 +110,7 @@ void mc_print_help(void)
     puts("  clear, /clear             Membersihkan tampilan terminal");
     puts("  set-target <pid>          Memilih proses untuk diperiksa/checkpoint");
     puts("  freeze                    Menghentikan target sementara dan menyimpan dump register awal");
-    puts("  dump-memory               Membuat direktori scaffold checkpoint");
+    puts("  dump-memory               Menulis metadata peta memori ke checkpoint");
     puts("  restore <checkpoint_dir>  Placeholder untuk entry point restore");
     puts("  exit                      Keluar dari shell interaktif");
     puts("");

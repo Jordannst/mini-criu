@@ -12,6 +12,8 @@
 
 #define MC_MAX_TOKENS 8
 #define MC_DEFAULT_CHECKPOINT_ROOT "checkpoints"
+#define MC_REGION_PERMS_LEN 5
+#define MC_REGION_LABEL_LEN 256
 
 typedef enum {
     MC_CMD_INVALID = -1,
@@ -38,6 +40,15 @@ typedef struct {
     char last_checkpoint_dir[PATH_MAX];
     bool running;
 } mc_context;
+
+typedef struct {
+    unsigned long long start_address;
+    unsigned long long end_address;
+    unsigned long long offset;
+    char permissions[MC_REGION_PERMS_LEN];
+    char label[MC_REGION_LABEL_LEN];
+    bool selected;
+} mc_memory_region;
 
 void mc_init_context(mc_context *ctx);
 int mc_run_cli(mc_context *ctx, int argc, char **argv);
