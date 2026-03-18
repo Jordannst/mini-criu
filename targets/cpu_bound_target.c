@@ -6,6 +6,9 @@
 
 static volatile sig_atomic_t keep_running = 1;
 
+/*
+ * Handler sinyal sederhana agar target bisa berhenti dengan rapi saat diuji.
+ */
 static void handle_signal(int signo)
 {
     (void)signo;
@@ -24,11 +27,18 @@ static void allow_ptrace_for_demo(void)
     }
 }
 
+/*
+ * Program ini sengaja sangat sederhana:
+ * - terus menghitung di CPU
+ * - jarang melakukan I/O
+ * - mudah diamati saat di-attach oleh mini-criu
+ */
 int main(void)
 {
     unsigned long long iterations = 0;
     uint64_t accumulator = 0;
 
+    /* Daftarkan handler agar Ctrl+C dan SIGTERM menghentikan loop utama. */
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     allow_ptrace_for_demo();
@@ -37,10 +47,15 @@ int main(void)
     puts("Proses ini berjalan dalam loop aritmetika sederhana.");
     puts("Gunakan Ctrl+C untuk menghentikannya.");
 
+    /*
+     * Loop ini menjaga proses tetap aktif dan mengubah nilai internal secara
+     * terus-menerus, sehingga cocok untuk uji attach, freeze, dan dump register.
+     */
     while (keep_running) {
         accumulator += (iterations % 97u) * (iterations % 13u);
         ++iterations;
 
+        /* Heartbeat membantu memastikan proses masih berjalan saat diuji. */
         if (iterations % 100000000ULL == 0) {
             printf("heartbeat: iterasi=%llu akumulator=%llu\n",
                    iterations,

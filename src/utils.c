@@ -10,6 +10,11 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * Mengisi konteks awal aplikasi.
+ *
+ * Nilai default ini dipakai oleh seluruh command selama sesi CLI berjalan.
+ */
 void mc_init_context(mc_context *ctx)
 {
     ctx->target_pid = -1;
@@ -18,6 +23,11 @@ void mc_init_context(mc_context *ctx)
     ctx->last_checkpoint_dir[0] = '\0';
 }
 
+/*
+ * Menghapus karakter akhir baris dari input `fgets`.
+ *
+ * Ini membantu parser command bekerja pada teks yang sudah bersih.
+ */
 void mc_trim_newline(char *line)
 {
     size_t len = strlen(line);
@@ -27,6 +37,11 @@ void mc_trim_newline(char *line)
     }
 }
 
+/*
+ * Menghapus spasi dan tab di awal/akhir string.
+ *
+ * Fungsi ini dipakai sebelum tokenisasi command agar input lebih konsisten.
+ */
 char *mc_trim_whitespace(char *text)
 {
     char *end;
@@ -47,6 +62,11 @@ char *mc_trim_whitespace(char *text)
     return text;
 }
 
+/*
+ * Mengubah teks menjadi PID yang valid.
+ *
+ * Hanya bilangan bulat positif yang diterima sebagai PID target.
+ */
 bool mc_parse_pid(const char *text, pid_t *pid_out)
 {
     char *end = NULL;
@@ -75,6 +95,9 @@ bool mc_process_exists(pid_t pid)
     return errno == EPERM;
 }
 
+/*
+ * Mengecek apakah path yang diberikan adalah direktori.
+ */
 bool mc_directory_exists(const char *path)
 {
     struct stat st;
@@ -86,6 +109,11 @@ bool mc_directory_exists(const char *path)
     return S_ISDIR(st.st_mode);
 }
 
+/*
+ * Membuat direktori jika belum ada.
+ *
+ * Fungsi ini dipakai untuk root checkpoint dan folder checkpoint hasil dump.
+ */
 int mc_ensure_directory(const char *path)
 {
     if (mc_directory_exists(path)) {
@@ -99,6 +127,11 @@ int mc_ensure_directory(const char *path)
     return errno == EEXIST ? 0 : -1;
 }
 
+/*
+ * Menulis seluruh teks ke file.
+ *
+ * Helper ini dipakai untuk file metadata sederhana yang isinya berupa teks.
+ */
 int mc_write_text_file(const char *path, const char *contents)
 {
     FILE *file = fopen(path, "w");
@@ -115,6 +148,9 @@ int mc_write_text_file(const char *path, const char *contents)
     return fclose(file);
 }
 
+/*
+ * Menggabungkan dua bagian path dengan separator `/`.
+ */
 int mc_join_path(char *buffer, size_t size, const char *left, const char *right)
 {
     int written = snprintf(buffer, size, "%s/%s", left, right);
@@ -126,6 +162,9 @@ int mc_join_path(char *buffer, size_t size, const char *left, const char *right)
     return 0;
 }
 
+/*
+ * Membuat timestamp singkat untuk nama direktori dan metadata checkpoint.
+ */
 void mc_format_timestamp(char *buffer, size_t size)
 {
     time_t now = time(NULL);
@@ -135,16 +174,25 @@ void mc_format_timestamp(char *buffer, size_t size)
     strftime(buffer, size, "%Y%m%d-%H%M%S", &tm_now);
 }
 
+/*
+ * Helper log sederhana untuk pesan informasional.
+ */
 void mc_log_info(const char *message)
 {
     fprintf(stdout, "[info] %s\n", message);
 }
 
+/*
+ * Helper log sederhana untuk galat yang tidak membutuhkan `errno`.
+ */
 void mc_log_error(const char *message)
 {
     fprintf(stderr, "[galat] %s\n", message);
 }
 
+/*
+ * Helper log untuk galat sistem yang memiliki pesan dari `errno`.
+ */
 void mc_log_system_error(const char *message)
 {
     int saved_errno = errno;
@@ -152,6 +200,9 @@ void mc_log_system_error(const char *message)
     fprintf(stderr, "[galat] %s: %s\n", message, strerror(saved_errno));
 }
 
+/*
+ * Menyimpan PID target ke konteks setelah memastikan prosesnya ada.
+ */
 int mc_set_target(mc_context *ctx, pid_t pid)
 {
     if (!mc_process_exists(pid)) {

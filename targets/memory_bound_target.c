@@ -10,6 +10,9 @@
 
 static volatile sig_atomic_t keep_running = 1;
 
+/*
+ * Handler sinyal sederhana agar target bisa keluar dengan rapi saat diuji.
+ */
 static void handle_signal(int signo)
 {
     (void)signo;
@@ -28,16 +31,25 @@ static void allow_ptrace_for_demo(void)
     }
 }
 
+/*
+ * Program ini menjaga area memori cukup besar tetap aktif dan terus berubah.
+ *
+ * Target seperti ini berguna untuk menguji parsing maps dan dump memori karena
+ * heap serta region writable lain akan berisi data yang berubah dari waktu ke
+ * waktu.
+ */
 int main(void)
 {
     unsigned char *buffer;
     size_t pass = 0;
     unsigned long checksum = 0;
 
+    /* Daftarkan handler agar proses dapat dihentikan dari terminal dengan rapi. */
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     allow_ptrace_for_demo();
 
+    /* Buffer besar ini dipakai untuk memaksa adanya aktivitas tulis di memori. */
     buffer = malloc(BUFFER_SIZE);
     if (buffer == NULL) {
         perror("gagal malloc");
@@ -48,6 +60,10 @@ int main(void)
     printf("Buffer %d MiB dialokasikan untuk penulisan halaman berulang.\n", BUFFER_SIZE / (1024 * 1024));
     puts("Gunakan Ctrl+C untuk menghentikannya.");
 
+    /*
+     * Setiap putaran menulis satu byte per halaman. Pola ini sengaja ringan,
+     * tetapi cukup untuk membuat isi memori berubah dan mudah diamati.
+     */
     while (keep_running) {
         checksum = 0;
 
@@ -57,11 +73,13 @@ int main(void)
         }
 
         ++pass;
+        /* Heartbeat memperlihatkan bahwa buffer terus diperbarui. */
         printf("heartbeat: putaran=%zu checksum=%lu\n", pass, checksum);
         fflush(stdout);
         sleep(1);
     }
 
+    /* Bebaskan buffer sebelum proses selesai. */
     free(buffer);
     printf("memory_bound_target berhenti setelah %zu putaran\n", pass);
     return 0;

@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * Menerjemahkan nama command dari input pengguna ke enum internal.
+ */
 static mc_command_kind mc_lookup_command(const char *name)
 {
     if (strcmp(name, "help") == 0) {
@@ -33,6 +36,11 @@ static mc_command_kind mc_lookup_command(const char *name)
     return MC_CMD_INVALID;
 }
 
+/*
+ * Memvalidasi jumlah argumen untuk setiap command.
+ *
+ * Fungsi ini dipakai baik untuk mode satu command maupun mode interaktif.
+ */
 static int mc_parse_tokens(int argc, char **argv, mc_command *cmd)
 {
     if (argc <= 0) {
@@ -94,6 +102,9 @@ static int mc_parse_tokens(int argc, char **argv, mc_command *cmd)
     return 0;
 }
 
+/*
+ * Menampilkan identitas singkat aplikasi saat CLI dimulai.
+ */
 void mc_print_banner(void)
 {
     puts("mini-criu");
@@ -101,6 +112,9 @@ void mc_print_banner(void)
     puts("Ketik 'help' untuk melihat perintah yang tersedia.");
 }
 
+/*
+ * Menampilkan daftar command yang bisa dipakai pengguna.
+ */
 void mc_print_help(void)
 {
     puts("");
@@ -110,12 +124,16 @@ void mc_print_help(void)
     puts("  clear, /clear             Membersihkan tampilan terminal");
     puts("  set-target <pid>          Memilih proses untuk diperiksa/checkpoint");
     puts("  freeze                    Menghentikan target sementara dan menyimpan dump register awal");
-    puts("  dump-memory               Menulis metadata peta memori ke checkpoint");
+    puts("  dump-memory               Menulis mem.meta dan mem.dump ke checkpoint");
     puts("  restore <checkpoint_dir>  Placeholder untuk entry point restore");
     puts("  exit                      Keluar dari shell interaktif");
     puts("");
 }
 
+/*
+ * Menampilkan konteks sesi saat ini agar pengguna tahu target dan folder
+ * checkpoint yang sedang aktif.
+ */
 void mc_print_status(const mc_context *ctx)
 {
     puts("");
@@ -136,6 +154,9 @@ void mc_print_status(const mc_context *ctx)
     puts("");
 }
 
+/*
+ * Memecah satu baris input menjadi token command dan argumen.
+ */
 int mc_parse_command(char *line, mc_command *cmd)
 {
     char *tokens[MC_MAX_TOKENS];
@@ -167,6 +188,9 @@ int mc_parse_command(char *line, mc_command *cmd)
     return mc_parse_tokens(argc, tokens, cmd);
 }
 
+/*
+ * Menjalankan command yang sudah lolos parsing.
+ */
 int mc_execute_command(mc_context *ctx, const mc_command *cmd)
 {
     pid_t pid = -1;
@@ -207,6 +231,9 @@ int mc_execute_command(mc_context *ctx, const mc_command *cmd)
     return 1;
 }
 
+/*
+ * Menjalankan CLI untuk satu command langsung dari argumen program.
+ */
 static int mc_run_single_command(mc_context *ctx, int argc, char **argv)
 {
     mc_command cmd;
@@ -224,6 +251,12 @@ static int mc_run_single_command(mc_context *ctx, int argc, char **argv)
     return mc_execute_command(ctx, &cmd);
 }
 
+/*
+ * Menjalankan mode REPL interaktif.
+ *
+ * Loop ini terus membaca command sampai pengguna menjalankan `exit` atau input
+ * berakhir.
+ */
 static int mc_run_repl(mc_context *ctx)
 {
     char line[512];
@@ -257,6 +290,9 @@ static int mc_run_repl(mc_context *ctx)
     return 0;
 }
 
+/*
+ * Menentukan apakah program berjalan dalam mode satu command atau REPL.
+ */
 int mc_run_cli(mc_context *ctx, int argc, char **argv)
 {
     if (argc > 1) {

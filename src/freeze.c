@@ -9,11 +9,11 @@
 #include <unistd.h>
 
 /*
- * Menyiapkan direktori output untuk fase freeze.
+ * Menyiapkan direktori output untuk hasil freeze.
  *
  * Jika konteks sudah memiliki checkpoint terakhir yang masih ada, direktori itu
- * digunakan kembali agar fase berikutnya dapat menambahkan file lain ke lokasi
- * yang sama. Jika belum ada, fungsi ini membuat direktori checkpoint baru.
+ * digunakan kembali agar file metadata lain bisa ditulis ke lokasi yang sama.
+ * Jika belum ada, fungsi ini membuat direktori checkpoint baru.
  */
 static int mc_prepare_freeze_checkpoint_dir(mc_context *ctx,
                                             const char *timestamp,
@@ -70,7 +70,7 @@ static int mc_prepare_freeze_checkpoint_dir(mc_context *ctx,
  * Menulis register CPU ke file teks agar mudah dibaca saat dipelajari.
  *
  * Format teks dipilih supaya isi file dapat langsung dibuka dan dijelaskan
- * tanpa perlu alat tambahan pada fase awal proyek ini.
+ * tanpa perlu alat tambahan lain.
  */
 static int mc_write_register_dump(const char *path,
                                   pid_t pid,
@@ -158,10 +158,10 @@ static int mc_write_register_dump(const char *path,
 }
 
 /*
- * Menulis metadata checkpoint awal yang bermakna.
+ * Menulis metadata dasar hasil freeze.
  *
- * Pada fase ini metadata belum menyimpan peta memori atau isi memori proses.
- * File ini hanya mendeskripsikan hasil freeze awal dan lokasi dump register.
+ * File ini menjelaskan bahwa register sudah berhasil diambil dan menunjukkan
+ * file mana yang berisi dump register.
  */
 static int mc_write_freeze_metadata(const char *path,
                                     pid_t pid,
@@ -174,7 +174,7 @@ static int mc_write_freeze_metadata(const char *path,
 
     written = snprintf(metadata,
                        sizeof(metadata),
-                       "fase=freeze\n"
+                       "jenis_checkpoint=freeze\n"
                        "pid_target=%d\n"
                        "dibuat_pada=%s\n"
                        "status=register_berhasil_diambil\n"
@@ -182,9 +182,9 @@ static int mc_write_freeze_metadata(const char *path,
                        "file_register=regs.dump\n"
                        "rip_awal=0x%llx\n"
                        "rsp_awal=0x%llx\n"
-                       "dump_memori=belum_diimplementasikan\n"
+                       "dump_memori=tersedia_melalui_command_dump-memory\n"
                        "restore=belum_diimplementasikan\n"
-                       "catatan=Fase ini hanya mencakup attach, sinkronisasi stop, dan dump register awal.\n",
+                       "catatan=Freeze mencakup attach, sinkronisasi stop, dan dump register awal. Dump memori mentah dijalankan terpisah melalui command dump-memory.\n",
                        pid,
                        timestamp,
                        stop_signal,
@@ -217,8 +217,8 @@ int mc_freeze_target(mc_context *ctx)
     bool stopped = false;
 
     /*
-     * Validasi awal menjaga agar ptrace hanya dijalankan untuk PID yang memang
-     * sudah dipilih dan masih terlihat oleh proses mini-criu.
+     * Validasi awal mencegah ptrace dijalankan pada PID yang belum dipilih atau
+     * proses yang sudah tidak ada.
      */
     if (ctx->target_pid <= 0) {
         mc_log_error("Belum ada target yang dipilih. Gunakan 'set-target <pid>' terlebih dahulu.");
@@ -234,7 +234,8 @@ int mc_freeze_target(mc_context *ctx)
 
     /*
      * Attach membuat target masuk ke mode trace. Setelah itu kita wajib menunggu
-     * dengan waitpid agar target benar-benar berhenti sebelum register dibaca.
+     * dengan waitpid agar target benar-benar berhenti sebelum register dibaca
+     * atau file checkpoint ditulis.
      */
     if (ptrace(PTRACE_ATTACH, ctx->target_pid, NULL, NULL) == -1) {
         if (errno == EPERM) {
@@ -263,7 +264,8 @@ int mc_freeze_target(mc_context *ctx)
 
     /*
      * Setelah target berhenti, register CPU dapat diambil dengan aman melalui
-     * PTRACE_GETREGS sebagai data checkpoint awal yang paling kecil.
+     * PTRACE_GETREGS. Data ini menjadi snapshot register yang paling awal dan
+     * paling kecil untuk disimpan.
      */
     if (ptrace(PTRACE_GETREGS, ctx->target_pid, NULL, &regs) == -1) {
         mc_log_system_error("Gagal mengambil register CPU dari target");
@@ -273,8 +275,10 @@ int mc_freeze_target(mc_context *ctx)
     mc_format_timestamp(timestamp, sizeof(timestamp));
 
     /*
-     * Direktori checkpoint dibuat atau digunakan kembali setelah register berhasil
-     * diambil, lalu data awal ditulis ke file yang mudah diperiksa.
+     * Setelah register tersedia, direktori checkpoint disiapkan dan dua file
+     * awal ditulis:
+     * - `regs.dump` untuk isi register
+     * - `checkpoint.info` untuk ringkasan checkpoint
      */
     if (mc_prepare_freeze_checkpoint_dir(ctx, timestamp, checkpoint_dir, sizeof(checkpoint_dir)) != 0) {
         goto cleanup;
@@ -300,14 +304,13 @@ int mc_freeze_target(mc_context *ctx)
 
     printf("Freeze awal berhasil. Data disimpan di: %s\n", checkpoint_dir);
     puts("File yang dihasilkan: checkpoint.info dan regs.dump.");
-    puts("TODO: fase berikutnya akan menambahkan dump memori. Restore belum diimplementasikan.");
+    puts("Catatan: dump memori mentah tersedia melalui command 'dump-memory'. Restore masih belum diimplementasikan.");
     result = 0;
 
 cleanup:
     /*
-     * Pada fase ini target dilepas kembali agar proses dapat melanjutkan eksekusi.
-     * Nanti, saat dump memori ditambahkan, alur ini bisa diubah agar target tetap
-     * berhenti sampai seluruh data checkpoint selesai diambil.
+     * Target selalu dilepas kembali setelah pekerjaan freeze selesai agar proses
+     * bisa melanjutkan eksekusi normal dan tidak tertahan oleh tracer.
      */
     if (attached) {
         if (ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) == -1) {
