@@ -145,6 +145,13 @@ void mc_log_error(const char *message)
     fprintf(stderr, "[galat] %s\n", message);
 }
 
+void mc_log_system_error(const char *message)
+{
+    int saved_errno = errno;
+
+    fprintf(stderr, "[galat] %s: %s\n", message, strerror(saved_errno));
+}
+
 int mc_set_target(mc_context *ctx, pid_t pid)
 {
     if (!mc_process_exists(pid)) {

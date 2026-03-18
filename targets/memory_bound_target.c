@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #define BUFFER_SIZE (64 * 1024 * 1024)
@@ -15,6 +16,18 @@ static void handle_signal(int signo)
     keep_running = 0;
 }
 
+/*
+ * Pada Linux/WSL modern, ptrace untuk proses sibling sering dibatasi.
+ * Dummy target ini secara eksplisit mengizinkan tracing agar fitur freeze
+ * dapat diuji dari CLI mini-criu selama pengembangan.
+ */
+static void allow_ptrace_for_demo(void)
+{
+    if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) == -1) {
+        perror("gagal mengatur izin ptrace");
+    }
+}
+
 int main(void)
 {
     unsigned char *buffer;
@@ -23,6 +36,7 @@ int main(void)
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+    allow_ptrace_for_demo();
 
     buffer = malloc(BUFFER_SIZE);
     if (buffer == NULL) {

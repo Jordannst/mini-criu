@@ -57,6 +57,7 @@ int mc_join_path(char *buffer, size_t size, const char *left, const char *right)
 void mc_format_timestamp(char *buffer, size_t size);
 void mc_log_info(const char *message);
 void mc_log_error(const char *message);
+void mc_log_system_error(const char *message);
 
 int mc_set_target(mc_context *ctx, pid_t pid);
 int mc_freeze_target(mc_context *ctx);

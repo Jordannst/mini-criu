@@ -104,7 +104,7 @@ void mc_print_help(void)
     puts("  help                      Menampilkan pesan bantuan ini");
     puts("  status                    Menampilkan status CLI saat ini");
     puts("  set-target <pid>          Memilih proses untuk diperiksa/checkpoint");
-    puts("  freeze                    Placeholder untuk penghentian proses berbasis ptrace");
+    puts("  freeze                    Menghentikan target sementara dan menyimpan dump register awal");
     puts("  dump-memory               Membuat direktori scaffold checkpoint");
     puts("  restore <checkpoint_dir>  Placeholder untuk entry point restore");
     puts("  exit                      Keluar dari shell interaktif");
