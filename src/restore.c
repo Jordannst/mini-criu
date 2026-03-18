@@ -2,10 +2,13 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 typedef struct {
     unsigned long long start_address;
@@ -49,6 +52,12 @@ typedef struct {
 } mc_restore_registers;
 
 typedef struct {
+    pid_t pid;
+    bool created;
+    bool stopped;
+} mc_restore_target;
+
+typedef struct {
     char checkpoint_dir[PATH_MAX];
     char snapshot_id[MC_SNAPSHOT_ID_LEN];
     pid_t pid_target;
@@ -59,6 +68,7 @@ typedef struct {
     unsigned long long total_dumped_bytes;
     unsigned long long mem_dump_size;
     mc_restore_registers regs;
+    mc_restore_target target;
     mc_restore_region *regions;
     size_t region_count;
 } mc_restore_plan;
@@ -724,6 +734,81 @@ static int mc_validate_dump_size(const char *mem_dump_path, mc_restore_plan *pla
 }
 
 /*
+ * Restore nantinya membutuhkan proses target baru sebagai tempat penulisan
+ * register dan memori hasil checkpoint.
+ *
+ * Pada tahap ini child hanya dibuat sebagai kerangka minimal, lalu dihentikan
+ * dengan `SIGSTOP` agar parent bisa memastikan ada kandidat proses yang siap
+ * dimanipulasi pada tahap berikutnya.
+ */
+static int mc_create_restore_target(mc_restore_plan *plan)
+{
+    int wait_status = 0;
+    pid_t child_pid = fork();
+
+    if (child_pid < 0) {
+        mc_log_system_error("Gagal membuat proses target restore");
+        return -1;
+    }
+
+    if (child_pid == 0) {
+        raise(SIGSTOP);
+        pause();
+        _exit(0);
+    }
+
+    if (waitpid(child_pid, &wait_status, WUNTRACED) == -1) {
+        kill(child_pid, SIGKILL);
+        waitpid(child_pid, NULL, 0);
+        mc_log_system_error("Gagal menunggu target restore berhenti");
+        return -1;
+    }
+
+    if (!WIFSTOPPED(wait_status)) {
+        kill(child_pid, SIGKILL);
+        waitpid(child_pid, NULL, 0);
+        mc_log_error("Target restore tidak masuk ke status stop yang diharapkan.");
+        return -1;
+    }
+
+    plan->target.pid = child_pid;
+    plan->target.created = true;
+    plan->target.stopped = true;
+    return 0;
+}
+
+/*
+ * Child kerangka restore dibersihkan kembali setelah inspeksi selesai.
+ *
+ * Tahap ini belum menulis register atau memori ke child tersebut, jadi proses
+ * sementara tidak perlu dibiarkan hidup setelah statusnya berhasil dilaporkan.
+ */
+static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
+{
+    if (!plan->target.created) {
+        return 0;
+    }
+
+    if (kill(plan->target.pid, SIGKILL) == -1 && errno != ESRCH) {
+        mc_log_system_error("Gagal menghentikan target restore sementara");
+        return -1;
+    }
+
+    if (waitpid(plan->target.pid, NULL, 0) == -1 && errno != ECHILD) {
+        mc_log_system_error("Gagal membersihkan target restore sementara");
+        return -1;
+    }
+
+    if (announce) {
+        puts("Kerangka target restore sementara sudah dibersihkan kembali.");
+    }
+
+    plan->target.created = false;
+    plan->target.stopped = false;
+    return 0;
+}
+
+/*
  * Ringkasan ini menunjukkan bahwa checkpoint berhasil dimuat dan sudah cukup
  * lengkap untuk masuk ke tahap restore berikutnya, walaupun eksekusi restore
  * nyata belum dilakukan.
@@ -751,8 +836,14 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
         printf("RAX checkpoint    : 0x%llx\n", plan->regs.rax);
     }
 
-    puts("Status restore    : metadata dan register checkpoint valid, rencana restore awal berhasil disusun.");
-    puts("Catatan           : eksekusi restore belum dijalankan.");
+    printf("Target restore    : %s\n", plan->target.created ? "berhasil dibuat" : "belum dibuat");
+    if (plan->target.created) {
+        printf("PID target baru   : %d\n", plan->target.pid);
+        printf("Status target     : %s\n", plan->target.stopped ? "berhenti dan siap untuk tahap berikutnya" : "belum berhenti");
+    }
+
+    puts("Status restore    : metadata, register, dan kerangka target restore siap untuk tahap berikutnya.");
+    puts("Catatan           : register dan memori belum ditulis ke target restore.");
     puts("");
 }
 
@@ -827,6 +918,16 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
         return 1;
     }
 
+    /*
+     * Setelah checkpoint dianggap valid, tool mencoba membuat child baru yang
+     * nantinya dapat dipakai sebagai wadah restore. Tahap ini berhenti setelah
+     * child berhasil dibuat dan dihentikan.
+     */
+    if (mc_create_restore_target(&plan) != 0) {
+        free(plan.regions);
+        return 1;
+    }
+
     snprintf(ctx->last_checkpoint_dir, sizeof(ctx->last_checkpoint_dir), "%s", checkpoint_dir);
 
     puts("Checkpoint berhasil dimuat untuk persiapan restore.");
@@ -834,9 +935,14 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
 
     /*
      * Persiapan restore berhenti di sini. Struktur internal sudah cukup untuk
-     * tahap berikutnya, tetapi tool belum membuat proses baru atau menulis
-     * register/memori ke proses manapun.
+     * tahap berikutnya, tetapi tool belum menulis register atau memori ke
+     * target restore yang baru dibuat.
      */
+    if (mc_cleanup_restore_target(&plan, true) != 0) {
+        free(plan.regions);
+        return 1;
+    }
+
     free(plan.regions);
     return 0;
 }
