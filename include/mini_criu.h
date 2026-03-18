@@ -14,6 +14,7 @@
 #define MC_DEFAULT_CHECKPOINT_ROOT "checkpoints"
 #define MC_REGION_PERMS_LEN 5
 #define MC_REGION_LABEL_LEN 256
+#define MC_REGION_DUMP_STATUS_LEN 32
 
 typedef enum {
     MC_CMD_INVALID = -1,
@@ -45,8 +46,11 @@ typedef struct {
     unsigned long long start_address;
     unsigned long long end_address;
     unsigned long long offset;
+    unsigned long long dump_offset;
+    unsigned long long dumped_size;
     char permissions[MC_REGION_PERMS_LEN];
     char label[MC_REGION_LABEL_LEN];
+    char dump_status[MC_REGION_DUMP_STATUS_LEN];
     bool selected;
 } mc_memory_region;
 
