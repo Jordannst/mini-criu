@@ -11,9 +11,9 @@
 /*
  * Menyiapkan direktori output untuk hasil freeze.
  *
- * Jika konteks sudah memiliki checkpoint terakhir yang masih ada, direktori itu
- * digunakan kembali agar file metadata lain bisa ditulis ke lokasi yang sama.
- * Jika belum ada, fungsi ini membuat direktori checkpoint baru.
+ * Setiap command `freeze` yang berhasil harus membuka snapshot baru. Karena itu,
+ * direktori checkpoint selalu dibuat baru agar satu folder mewakili satu event
+ * snapshot yang jelas.
  */
 static int mc_prepare_freeze_checkpoint_dir(mc_context *ctx,
                                             const char *timestamp,
@@ -22,15 +22,6 @@ static int mc_prepare_freeze_checkpoint_dir(mc_context *ctx,
 {
     char directory_name[128];
     int written;
-
-    if (ctx->last_checkpoint_dir[0] != '\0' && mc_directory_exists(ctx->last_checkpoint_dir)) {
-        written = snprintf(checkpoint_dir, size, "%s", ctx->last_checkpoint_dir);
-        if (written < 0 || (size_t)written >= size) {
-            mc_log_error("Path checkpoint terakhir terlalu panjang.");
-            return -1;
-        }
-        return 0;
-    }
 
     if (mc_ensure_directory(ctx->checkpoint_root) != 0) {
         mc_log_error("Gagal membuat direktori root checkpoint.");
@@ -165,6 +156,7 @@ static int mc_write_register_dump(const char *path,
  */
 static int mc_write_freeze_metadata(const char *path,
                                     pid_t pid,
+                                    const char *snapshot_id,
                                     const char *timestamp,
                                     int stop_signal,
                                     const struct user_regs_struct *regs)
@@ -175,16 +167,19 @@ static int mc_write_freeze_metadata(const char *path,
     written = snprintf(metadata,
                        sizeof(metadata),
                        "jenis_checkpoint=freeze\n"
+                       "snapshot_id=%s\n"
                        "pid_target=%d\n"
                        "dibuat_pada=%s\n"
                        "status=register_berhasil_diambil\n"
+                       "status_snapshot=aktif_menunggu_dump_memori\n"
                        "sinyal_stop=%d\n"
                        "file_register=regs.dump\n"
                        "rip_awal=0x%llx\n"
                        "rsp_awal=0x%llx\n"
-                       "dump_memori=tersedia_melalui_command_dump-memory\n"
+                       "dump_memori=menunggu_command_dump-memory\n"
                        "restore=belum_diimplementasikan\n"
-                       "catatan=Freeze mencakup attach, sinkronisasi stop, dan dump register awal. Dump memori mentah dijalankan terpisah melalui command dump-memory.\n",
+                       "catatan=Target tetap dihentikan setelah freeze agar dump register dan dump memori bisa berasal dari snapshot yang sama selama sesi CLI ini.\n",
+                       snapshot_id,
                        pid,
                        timestamp,
                        stop_signal,
@@ -220,6 +215,11 @@ int mc_freeze_target(mc_context *ctx)
      * Validasi awal mencegah ptrace dijalankan pada PID yang belum dipilih atau
      * proses yang sudah tidak ada.
      */
+    if (ctx->snapshot_active) {
+        mc_log_error("Masih ada snapshot aktif. Jalankan 'dump-memory' untuk menyelesaikannya atau keluar dari CLI untuk membatalkannya.");
+        return 1;
+    }
+
     if (ctx->target_pid <= 0) {
         mc_log_error("Belum ada target yang dipilih. Gunakan 'set-target <pid>' terlebih dahulu.");
         return 1;
@@ -298,22 +298,36 @@ int mc_freeze_target(mc_context *ctx)
         goto cleanup;
     }
 
-    if (mc_write_freeze_metadata(metadata_path, ctx->target_pid, timestamp, stop_signal, &regs) != 0) {
+    if (mc_write_freeze_metadata(metadata_path, ctx->target_pid, timestamp, timestamp, stop_signal, &regs) != 0) {
         goto cleanup;
     }
 
+    /*
+     * Snapshot dinyatakan aktif setelah file register dan metadata awal selesai
+     * ditulis. Mulai titik ini target sengaja tetap dalam keadaan stop sampai
+     * `dump-memory` selesai atau sesi CLI berakhir.
+     */
+    snprintf(ctx->active_snapshot_id, sizeof(ctx->active_snapshot_id), "%s", timestamp);
+    ctx->snapshot_active = true;
+    attached = false;
+
     printf("Freeze awal berhasil. Data disimpan di: %s\n", checkpoint_dir);
     puts("File yang dihasilkan: checkpoint.info dan regs.dump.");
-    puts("Catatan: dump memori mentah tersedia melalui command 'dump-memory'. Restore masih belum diimplementasikan.");
+    puts("Selama sesi CLI ini, target tetap dihentikan agar command 'dump-memory' dapat melanjutkan snapshot yang sama.");
+    puts("Catatan: jika sesi CLI berakhir sebelum dump-memory dijalankan, target akan dilepas kembali otomatis.");
     result = 0;
 
 cleanup:
     /*
-     * Target selalu dilepas kembali setelah pekerjaan freeze selesai agar proses
-     * bisa melanjutkan eksekusi normal dan tidak tertahan oleh tracer.
+     * Jika freeze gagal sebelum snapshot aktif terbentuk, target harus dilepas
+     * kembali agar proses tidak tertahan dalam keadaan stop.
      */
     if (attached) {
-        if (ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) == -1) {
+        if (ctx->snapshot_active) {
+            if (mc_release_snapshot(ctx, true) != 0) {
+                result = 1;
+            }
+        } else if (ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) == -1) {
             mc_log_system_error("Gagal melepaskan ptrace dari target");
             result = 1;
         } else if (stopped) {

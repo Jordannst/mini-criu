@@ -11,6 +11,11 @@
  */
 int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
 {
+    if (ctx->snapshot_active) {
+        mc_log_error("Masih ada snapshot aktif. Selesaikan dulu dengan 'dump-memory' atau keluar dari CLI.");
+        return 1;
+    }
+
     /*
      * Restore tidak boleh dilanjutkan jika folder checkpoint yang diminta
      * tidak tersedia.

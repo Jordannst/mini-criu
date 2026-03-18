@@ -13,56 +13,26 @@
 /*
  * Menyiapkan direktori checkpoint untuk hasil dump memori.
  *
- * Jika sudah ada checkpoint terakhir, direktori itu digunakan kembali agar
- * `checkpoint.info`, `regs.dump`, `mem.meta`, dan `mem.dump` berada pada
- * folder yang sama. Jika belum ada, fungsi ini membuat direktori checkpoint
- * baru.
+ * Dump memori hanya boleh melanjutkan snapshot yang sudah dibuka oleh `freeze`.
+ * Karena itu, fungsi ini hanya memakai direktori checkpoint yang sudah
+ * tercatat di konteks dan tidak membuat snapshot baru sendiri.
  */
 static int mc_prepare_memory_checkpoint_dir(mc_context *ctx,
                                             const char *timestamp,
                                             char *checkpoint_dir,
                                             size_t size)
 {
-    char directory_name[128];
     int written;
+    (void)timestamp;
 
-    if (ctx->last_checkpoint_dir[0] != '\0' && mc_directory_exists(ctx->last_checkpoint_dir)) {
-        written = snprintf(checkpoint_dir, size, "%s", ctx->last_checkpoint_dir);
-        if (written < 0 || (size_t)written >= size) {
-            mc_log_error("Path checkpoint terakhir terlalu panjang.");
-            return -1;
-        }
-        return 0;
-    }
-
-    if (mc_ensure_directory(ctx->checkpoint_root) != 0) {
-        mc_log_error("Gagal membuat direktori root checkpoint.");
+    if (ctx->last_checkpoint_dir[0] == '\0' || !mc_directory_exists(ctx->last_checkpoint_dir)) {
+        mc_log_error("Direktori snapshot aktif tidak tersedia.");
         return -1;
     }
 
-    written = snprintf(directory_name,
-                       sizeof(directory_name),
-                       "checkpoint-pid-%d-%s",
-                       ctx->target_pid,
-                       timestamp);
-    if (written < 0 || (size_t)written >= sizeof(directory_name)) {
-        mc_log_error("Nama direktori checkpoint terlalu panjang.");
-        return -1;
-    }
-
-    if (mc_join_path(checkpoint_dir, size, ctx->checkpoint_root, directory_name) != 0) {
-        mc_log_error("Path checkpoint terlalu panjang.");
-        return -1;
-    }
-
-    if (mc_ensure_directory(checkpoint_dir) != 0) {
-        mc_log_error("Gagal membuat direktori checkpoint.");
-        return -1;
-    }
-
-    written = snprintf(ctx->last_checkpoint_dir, sizeof(ctx->last_checkpoint_dir), "%s", checkpoint_dir);
-    if (written < 0 || (size_t)written >= sizeof(ctx->last_checkpoint_dir)) {
-        mc_log_error("Path checkpoint terlalu panjang untuk disimpan di konteks.");
+    written = snprintf(checkpoint_dir, size, "%s", ctx->last_checkpoint_dir);
+    if (written < 0 || (size_t)written >= size) {
+        mc_log_error("Path checkpoint terakhir terlalu panjang.");
         return -1;
     }
 
@@ -379,6 +349,7 @@ static int mc_dump_selected_regions(pid_t pid,
  */
 static int mc_write_memory_metadata_file(const char *path,
                                          pid_t pid,
+                                         const char *snapshot_id,
                                          const char *timestamp,
                                          const mc_memory_region *regions,
                                          size_t region_count,
@@ -396,6 +367,7 @@ static int mc_write_memory_metadata_file(const char *path,
 
     if (fprintf(file,
                 "jenis_dump=raw_memori\n"
+                "snapshot_id=%s\n"
                 "pid_target=%d\n"
                 "dibuat_pada=%s\n"
                 "aturan_seleksi=region_writable_private_rw-p\n"
@@ -406,6 +378,7 @@ static int mc_write_memory_metadata_file(const char *path,
                 "jumlah_region_dump_berhasil=%zu\n"
                 "jumlah_region_dump_terlewati=%zu\n"
                 "jumlah_byte_dump=%llu\n\n",
+                snapshot_id,
                 pid,
                 timestamp,
                 region_count,
@@ -465,6 +438,7 @@ static int mc_write_memory_metadata_file(const char *path,
  */
 static int mc_append_memory_summary(const char *path,
                                     pid_t pid,
+                                    const char *snapshot_id,
                                     const char *timestamp,
                                     size_t total_regions,
                                     size_t selected_regions,
@@ -482,8 +456,10 @@ static int mc_append_memory_summary(const char *path,
     if (fprintf(file,
                 "\n"
                 "jenis_dump_memori=raw_memori\n"
+                "snapshot_id_memori=%s\n"
                 "pid_target_memori=%d\n"
                 "dibuat_pada_memori=%s\n"
+                "status_snapshot=selesai\n"
                 "file_peta_memori=mem.meta\n"
                 "file_dump_memori=mem.dump\n"
                 "jumlah_region=%zu\n"
@@ -491,7 +467,9 @@ static int mc_append_memory_summary(const char *path,
                 "jumlah_region_dump_berhasil=%zu\n"
                 "jumlah_region_dump_terlewati=%zu\n"
                 "jumlah_byte_dump=%llu\n"
-                "catatan_memori=Dump dilakukan saat target dihentikan sementara. Byte register dan byte memori belum tentu berasal dari freeze yang sama.\n",
+                "konsistensi_snapshot=register_dan_memori_diambil_dari_stop_yang_sama\n"
+                "catatan_memori=Target dilepas kembali setelah dump-memory selesai. Restore masih belum diimplementasikan.\n",
+                snapshot_id,
                 pid,
                 timestamp,
                 total_regions,
@@ -525,16 +503,17 @@ int mc_dump_memory(mc_context *ctx)
     size_t dumped_regions = 0;
     size_t skipped_regions = 0;
     unsigned long long total_dumped_bytes = 0;
-    int wait_status = 0;
-    int stop_signal = 0;
     int result = 1;
-    bool attached = false;
-    bool stopped = false;
 
     /*
      * Validasi awal memastikan ada target yang bisa dibaca sebelum command ini
-     * mencoba attach dan membuka file `/proc`.
+     * membuka file `/proc`.
      */
+    if (!ctx->snapshot_active) {
+        mc_log_error("Belum ada snapshot aktif. Jalankan 'freeze' terlebih dahulu.");
+        return 1;
+    }
+
     if (ctx->target_pid <= 0) {
         mc_log_error("Belum ada target yang dipilih. Gunakan 'set-target <pid>' terlebih dahulu.");
         return 1;
@@ -548,34 +527,12 @@ int mc_dump_memory(mc_context *ctx)
     printf("Memulai dump memori untuk PID %d.\n", ctx->target_pid);
 
     /*
-     * Command `dump-memory` melakukan attach sendiri agar pembacaan maps dan
-     * `/proc/<pid>/mem` terjadi saat target sedang berhenti sementara.
+     * Pada titik ini target sudah berada dalam keadaan stop karena `freeze`
+     * belum melepaskan tracer. Dengan begitu, register dan memori diambil dari
+     * satu event snapshot yang lebih konsisten.
      */
-    if (ptrace(PTRACE_ATTACH, ctx->target_pid, NULL, NULL) == -1) {
-        if (errno == EPERM) {
-            mc_log_error("Gagal melakukan ptrace attach ke target. Target mungkin belum mengizinkan tracing dari proses ini.");
-        } else {
-            mc_log_system_error("Gagal melakukan ptrace attach ke target");
-        }
-        return 1;
-    }
-    attached = true;
-
-    puts("Attach berhasil. Menunggu target berhenti untuk dump memori...");
-    if (waitpid(ctx->target_pid, &wait_status, 0) == -1) {
-        mc_log_system_error("Gagal menunggu target berhenti");
-        goto cleanup;
-    }
-
-    if (!WIFSTOPPED(wait_status)) {
-        mc_log_error("Target tidak masuk ke status stop yang diharapkan.");
-        goto cleanup;
-    }
-    stopped = true;
-    stop_signal = WSTOPSIG(wait_status);
-    printf("Target berhenti dengan sinyal %d.\n", stop_signal);
-
-    mc_format_timestamp(timestamp, sizeof(timestamp));
+    printf("Melanjutkan snapshot aktif dengan ID %s.\n", ctx->active_snapshot_id);
+    snprintf(timestamp, sizeof(timestamp), "%s", ctx->active_snapshot_id);
 
     /*
      * Setelah target berhenti, daftar region dimuat lebih dulu agar kita tahu
@@ -637,6 +594,7 @@ int mc_dump_memory(mc_context *ctx)
 
     if (mc_write_memory_metadata_file(mem_meta_path,
                                       ctx->target_pid,
+                                      ctx->active_snapshot_id,
                                       timestamp,
                                       regions,
                                       region_count,
@@ -649,6 +607,7 @@ int mc_dump_memory(mc_context *ctx)
 
     if (mc_append_memory_summary(metadata_path,
                                  ctx->target_pid,
+                                 ctx->active_snapshot_id,
                                  timestamp,
                                  region_count,
                                  selected_count,
@@ -670,16 +629,12 @@ int mc_dump_memory(mc_context *ctx)
 
 cleanup:
     /*
-     * Tracer selalu dilepas kembali agar proses target tidak tertahan setelah
-     * command selesai, baik saat berhasil maupun saat terjadi galat.
+     * Setelah dump-memory selesai, snapshot dianggap ditutup. Target dilepas
+     * kembali baik saat berhasil maupun saat terjadi galat agar perilaku resume
+     * tetap mudah dipahami.
      */
-    if (attached) {
-        if (ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) == -1) {
-            mc_log_system_error("Gagal melepaskan ptrace dari target");
-            result = 1;
-        } else if (stopped) {
-            puts("Target dilepas kembali dan diizinkan berjalan.");
-        }
+    if (mc_release_snapshot(ctx, true) != 0) {
+        result = 1;
     }
 
     free(regions);

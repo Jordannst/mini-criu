@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -19,8 +20,10 @@ void mc_init_context(mc_context *ctx)
 {
     ctx->target_pid = -1;
     ctx->running = false;
+    ctx->snapshot_active = false;
     snprintf(ctx->checkpoint_root, sizeof(ctx->checkpoint_root), "%s", MC_DEFAULT_CHECKPOINT_ROOT);
     ctx->last_checkpoint_dir[0] = '\0';
+    ctx->active_snapshot_id[0] = '\0';
 }
 
 /*
@@ -201,10 +204,49 @@ void mc_log_system_error(const char *message)
 }
 
 /*
+ * Melepaskan target yang masih ditahan oleh snapshot aktif.
+ *
+ * Helper ini dipakai saat `dump-memory` selesai dan juga saat program keluar,
+ * sehingga perilaku stop/resume target tetap mudah dipahami.
+ */
+int mc_release_snapshot(mc_context *ctx, bool announce)
+{
+    if (!ctx->snapshot_active) {
+        return 0;
+    }
+
+    if (ctx->target_pid > 0 && ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) == -1) {
+        if (errno != ESRCH) {
+            mc_log_system_error("Gagal melepaskan ptrace dari target");
+            return -1;
+        }
+
+        if (announce) {
+            puts("Snapshot aktif dibersihkan, tetapi target sudah tidak tersedia.");
+        }
+    } else if (announce) {
+        puts("Target dilepas kembali dan diizinkan berjalan.");
+    }
+
+    ctx->snapshot_active = false;
+    ctx->active_snapshot_id[0] = '\0';
+    return 0;
+}
+
+/*
  * Menyimpan PID target ke konteks setelah memastikan prosesnya ada.
  */
 int mc_set_target(mc_context *ctx, pid_t pid)
 {
+    /*
+     * Mengganti target saat snapshot masih aktif akan membuat alur checkpoint
+     * membingungkan karena proses lama masih ditahan dalam keadaan stop.
+     */
+    if (ctx->snapshot_active) {
+        mc_log_error("Masih ada snapshot aktif. Jalankan 'dump-memory' untuk menyelesaikannya atau keluar dari CLI untuk membatalkannya.");
+        return 1;
+    }
+
     if (!mc_process_exists(pid)) {
         mc_log_error("PID target tidak berjalan atau tidak terlihat dari lingkungan ini.");
         return 1;

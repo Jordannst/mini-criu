@@ -123,8 +123,8 @@ void mc_print_help(void)
     puts("  status                    Menampilkan status CLI saat ini");
     puts("  clear, /clear             Membersihkan tampilan terminal");
     puts("  set-target <pid>          Memilih proses untuk diperiksa/checkpoint");
-    puts("  freeze                    Menghentikan target sementara dan menyimpan dump register awal");
-    puts("  dump-memory               Menulis mem.meta dan mem.dump ke checkpoint");
+    puts("  freeze                    Memulai snapshot, menyimpan register, dan menahan target tetap stop");
+    puts("  dump-memory               Menyelesaikan snapshot aktif dengan mem.meta dan mem.dump");
     puts("  restore <checkpoint_dir>  Placeholder untuk entry point restore");
     puts("  exit                      Keluar dari shell interaktif");
     puts("");
@@ -151,6 +151,9 @@ void mc_print_status(const mc_context *ctx)
     printf("Root checkpoint   : %s\n", ctx->checkpoint_root);
     printf("Checkpoint akhir  : %s\n",
            ctx->last_checkpoint_dir[0] != '\0' ? ctx->last_checkpoint_dir : "(belum ada)");
+    printf("Snapshot aktif    : %s\n", ctx->snapshot_active ? "ya" : "tidak");
+    printf("ID snapshot       : %s\n",
+           ctx->snapshot_active && ctx->active_snapshot_id[0] != '\0' ? ctx->active_snapshot_id : "(tidak ada)");
     puts("");
 }
 

@@ -15,6 +15,7 @@
 #define MC_REGION_PERMS_LEN 5
 #define MC_REGION_LABEL_LEN 256
 #define MC_REGION_DUMP_STATUS_LEN 32
+#define MC_SNAPSHOT_ID_LEN 32
 
 typedef enum {
     MC_CMD_INVALID = -1,
@@ -39,7 +40,9 @@ typedef struct {
     pid_t target_pid;
     char checkpoint_root[PATH_MAX];
     char last_checkpoint_dir[PATH_MAX];
+    char active_snapshot_id[MC_SNAPSHOT_ID_LEN];
     bool running;
+    bool snapshot_active;
 } mc_context;
 
 typedef struct {
@@ -74,6 +77,7 @@ void mc_format_timestamp(char *buffer, size_t size);
 void mc_log_info(const char *message);
 void mc_log_error(const char *message);
 void mc_log_system_error(const char *message);
+int mc_release_snapshot(mc_context *ctx, bool announce);
 
 int mc_set_target(mc_context *ctx, pid_t pid);
 int mc_freeze_target(mc_context *ctx);
