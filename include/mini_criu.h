@@ -17,6 +17,7 @@ typedef enum {
     MC_CMD_INVALID = -1,
     MC_CMD_HELP = 0,
     MC_CMD_STATUS,
+    MC_CMD_CLEAR,
     MC_CMD_SET_TARGET,
     MC_CMD_FREEZE,
     MC_CMD_DUMP_MEMORY,

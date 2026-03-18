@@ -31,6 +31,7 @@ mini-criu/
 │   ├── cpu_bound_target.c    # Proses target sederhana yang intensif CPU
 │   └── memory_bound_target.c # Proses target sederhana yang intensif memori
 ├── Makefile
+├── run-mini-criu             # Launcher untuk menjalankan CLI utama
 └── README.md
 ```
 
@@ -56,7 +57,15 @@ make clean
 
 ## Menjalankan Program
 
-Menjalankan CLI interaktif:
+Cara paling praktis untuk menjalankan CLI:
+
+```bash
+./run-mini-criu
+```
+
+Launcher ini akan menjalankan `make` otomatis jika binary utama belum tersedia.
+
+Menjalankan CLI langsung dari hasil build:
 
 ```bash
 ./build/mini-criu
@@ -65,15 +74,17 @@ Menjalankan CLI interaktif:
 Menjalankan satu command tanpa masuk ke mode interaktif:
 
 ```bash
-./build/mini-criu status
-./build/mini-criu help
-./build/mini-criu restore checkpoints/example
+./run-mini-criu status
+./run-mini-criu help
+./run-mini-criu restore checkpoints/example
 ```
 
 ### Command yang Tersedia
 
 - `help`
 - `status`
+- `clear`
+- `/clear`
 - `set-target <pid>`
 - `freeze`
 - `dump-memory`
@@ -92,7 +103,7 @@ Menjalankan satu command tanpa masuk ke mode interaktif:
 3. Jalankan CLI:
 
 ```bash
-./build/mini-criu
+./run-mini-criu
 ```
 
 4. Di dalam CLI:

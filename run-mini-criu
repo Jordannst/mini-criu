@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
+
+if [ ! -x "build/mini-criu" ]; then
+    echo "Binary build/mini-criu belum ada. Menjalankan build terlebih dahulu..."
+    make
+fi
+
+exec ./build/mini-criu "$@"

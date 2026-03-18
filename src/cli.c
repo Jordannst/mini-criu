@@ -11,6 +11,9 @@ static mc_command_kind mc_lookup_command(const char *name)
     if (strcmp(name, "status") == 0) {
         return MC_CMD_STATUS;
     }
+    if (strcmp(name, "clear") == 0 || strcmp(name, "/clear") == 0) {
+        return MC_CMD_CLEAR;
+    }
     if (strcmp(name, "set-target") == 0) {
         return MC_CMD_SET_TARGET;
     }
@@ -62,6 +65,7 @@ static int mc_parse_tokens(int argc, char **argv, mc_command *cmd)
     switch (cmd->kind) {
     case MC_CMD_HELP:
     case MC_CMD_STATUS:
+    case MC_CMD_CLEAR:
     case MC_CMD_FREEZE:
     case MC_CMD_DUMP_MEMORY:
     case MC_CMD_EXIT:
@@ -103,6 +107,7 @@ void mc_print_help(void)
     puts("Perintah yang tersedia:");
     puts("  help                      Menampilkan pesan bantuan ini");
     puts("  status                    Menampilkan status CLI saat ini");
+    puts("  clear, /clear             Membersihkan tampilan terminal");
     puts("  set-target <pid>          Memilih proses untuk diperiksa/checkpoint");
     puts("  freeze                    Menghentikan target sementara dan menyimpan dump register awal");
     puts("  dump-memory               Membuat direktori scaffold checkpoint");
@@ -172,6 +177,11 @@ int mc_execute_command(mc_context *ctx, const mc_command *cmd)
         return 0;
     case MC_CMD_STATUS:
         mc_print_status(ctx);
+        return 0;
+    case MC_CMD_CLEAR:
+        /* Gunakan escape ANSI agar layar terminal dibersihkan dan kursor kembali ke atas. */
+        fputs("\033[2J\033[H", stdout);
+        fflush(stdout);
         return 0;
     case MC_CMD_SET_TARGET:
         if (!mc_parse_pid(cmd->argv[1], &pid)) {
