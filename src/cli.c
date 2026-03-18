@@ -125,7 +125,7 @@ void mc_print_help(void)
     puts("  set-target <pid>          Memilih proses untuk diperiksa/checkpoint");
     puts("  freeze                    Memulai snapshot, menyimpan register, dan menahan target tetap stop");
     puts("  dump-memory               Menyelesaikan snapshot aktif dengan mem.meta dan mem.dump");
-    puts("  restore <checkpoint_dir>  Memuat checkpoint dan menyiapkan target restore sementara");
+    puts("  restore <checkpoint_dir>  Memuat checkpoint, membuat target restore, dan mencoba menerapkan register");
     puts("  exit                      Keluar dari shell interaktif");
     puts("");
 }

@@ -6,7 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ptrace.h>
 #include <sys/stat.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -55,6 +57,9 @@ typedef struct {
     pid_t pid;
     bool created;
     bool stopped;
+    bool traced;
+    bool regs_apply_attempted;
+    bool regs_apply_succeeded;
 } mc_restore_target;
 
 typedef struct {
@@ -737,9 +742,9 @@ static int mc_validate_dump_size(const char *mem_dump_path, mc_restore_plan *pla
  * Restore nantinya membutuhkan proses target baru sebagai tempat penulisan
  * register dan memori hasil checkpoint.
  *
- * Pada tahap ini child hanya dibuat sebagai kerangka minimal, lalu dihentikan
- * dengan `SIGSTOP` agar parent bisa memastikan ada kandidat proses yang siap
- * dimanipulasi pada tahap berikutnya.
+ * Child ini meminta untuk ditrace oleh parent melalui `PTRACE_TRACEME`, lalu
+ * berhenti dengan `SIGSTOP`. Dengan begitu, parent bisa langsung menyiapkan
+ * register target tanpa membuat arsitektur baru yang besar.
  */
 static int mc_create_restore_target(mc_restore_plan *plan)
 {
@@ -752,6 +757,9 @@ static int mc_create_restore_target(mc_restore_plan *plan)
     }
 
     if (child_pid == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+            _exit(1);
+        }
         raise(SIGSTOP);
         pause();
         _exit(0);
@@ -774,6 +782,7 @@ static int mc_create_restore_target(mc_restore_plan *plan)
     plan->target.pid = child_pid;
     plan->target.created = true;
     plan->target.stopped = true;
+    plan->target.traced = true;
     return 0;
 }
 
@@ -805,6 +814,72 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
 
     plan->target.created = false;
     plan->target.stopped = false;
+    plan->target.traced = false;
+    plan->target.regs_apply_attempted = false;
+    plan->target.regs_apply_succeeded = false;
+    return 0;
+}
+
+/*
+ * Register checkpoint dihubungkan ke target restore dengan langkah terkecil
+ * yang masih bermakna: parent membaca register child saat ini, lalu menimpa
+ * register umum dan pointer eksekusi dari checkpoint.
+ *
+ * Register segment dan base tidak disentuh pada tahap ini agar percobaan tetap
+ * konservatif. Tanpa pemulihan memori, target memang belum aman untuk dijalankan.
+ */
+static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
+{
+    struct user_regs_struct target_regs;
+
+    if (!plan->target.created || !plan->target.traced) {
+        mc_log_error("Target restore belum siap untuk penerapan register.");
+        return -1;
+    }
+
+    if (!plan->regs.loaded) {
+        mc_log_error("Data register checkpoint belum berhasil dimuat.");
+        return -1;
+    }
+
+    plan->target.regs_apply_attempted = true;
+
+    if (ptrace(PTRACE_GETREGS, plan->target.pid, NULL, &target_regs) == -1) {
+        mc_log_system_error("Gagal membaca register awal target restore");
+        return -1;
+    }
+
+    /*
+     * Hanya register umum yang diterapkan pada tahap ini. Nilai seperti RIP
+     * dan RSP memang ditulis, tetapi target tidak di-resume karena memory map
+     * checkpoint belum dipulihkan.
+     */
+    target_regs.r15 = plan->regs.r15;
+    target_regs.r14 = plan->regs.r14;
+    target_regs.r13 = plan->regs.r13;
+    target_regs.r12 = plan->regs.r12;
+    target_regs.rbp = plan->regs.rbp;
+    target_regs.rbx = plan->regs.rbx;
+    target_regs.r11 = plan->regs.r11;
+    target_regs.r10 = plan->regs.r10;
+    target_regs.r9 = plan->regs.r9;
+    target_regs.r8 = plan->regs.r8;
+    target_regs.rax = plan->regs.rax;
+    target_regs.rcx = plan->regs.rcx;
+    target_regs.rdx = plan->regs.rdx;
+    target_regs.rsi = plan->regs.rsi;
+    target_regs.rdi = plan->regs.rdi;
+    target_regs.orig_rax = plan->regs.orig_rax;
+    target_regs.rip = plan->regs.rip;
+    target_regs.eflags = plan->regs.eflags;
+    target_regs.rsp = plan->regs.rsp;
+
+    if (ptrace(PTRACE_SETREGS, plan->target.pid, NULL, &target_regs) == -1) {
+        mc_log_system_error("Gagal menerapkan register checkpoint ke target restore");
+        return -1;
+    }
+
+    plan->target.regs_apply_succeeded = true;
     return 0;
 }
 
@@ -840,10 +915,12 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
     if (plan->target.created) {
         printf("PID target baru   : %d\n", plan->target.pid);
         printf("Status target     : %s\n", plan->target.stopped ? "berhenti dan siap untuk tahap berikutnya" : "belum berhenti");
+        printf("Register dicoba   : %s\n", plan->target.regs_apply_attempted ? "ya" : "tidak");
+        printf("Register diterapkan: %s\n", plan->target.regs_apply_succeeded ? "berhasil" : "belum berhasil");
     }
 
-    puts("Status restore    : metadata, register, dan kerangka target restore siap untuk tahap berikutnya.");
-    puts("Catatan           : register dan memori belum ditulis ke target restore.");
+    puts("Status restore    : metadata dan target restore awal sudah disiapkan untuk tahap berikutnya.");
+    puts("Catatan           : memory checkpoint belum dipulihkan, sehingga target belum boleh dijalankan sebagai hasil restore.");
     puts("");
 }
 
@@ -924,6 +1001,16 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * child berhasil dibuat dan dihentikan.
      */
     if (mc_create_restore_target(&plan) != 0) {
+        free(plan.regions);
+        return 1;
+    }
+
+    /*
+     * Setelah child skeleton tersedia, tool mencoba menerapkan register
+     * checkpoint ke target tersebut sebagai langkah awal menuju restore nyata.
+     */
+    if (mc_apply_checkpoint_registers(&plan) != 0) {
+        mc_cleanup_restore_target(&plan, false);
         free(plan.regions);
         return 1;
     }
