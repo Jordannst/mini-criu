@@ -18,6 +18,37 @@ typedef struct {
 } mc_restore_region;
 
 typedef struct {
+    unsigned long long r15;
+    unsigned long long r14;
+    unsigned long long r13;
+    unsigned long long r12;
+    unsigned long long rbp;
+    unsigned long long rbx;
+    unsigned long long r11;
+    unsigned long long r10;
+    unsigned long long r9;
+    unsigned long long r8;
+    unsigned long long rax;
+    unsigned long long rcx;
+    unsigned long long rdx;
+    unsigned long long rsi;
+    unsigned long long rdi;
+    unsigned long long orig_rax;
+    unsigned long long rip;
+    unsigned long long cs;
+    unsigned long long eflags;
+    unsigned long long rsp;
+    unsigned long long ss;
+    unsigned long long fs_base;
+    unsigned long long gs_base;
+    unsigned long long ds;
+    unsigned long long es;
+    unsigned long long fs;
+    unsigned long long gs;
+    bool loaded;
+} mc_restore_registers;
+
+typedef struct {
     char checkpoint_dir[PATH_MAX];
     char snapshot_id[MC_SNAPSHOT_ID_LEN];
     pid_t pid_target;
@@ -27,6 +58,7 @@ typedef struct {
     size_t skipped_regions;
     unsigned long long total_dumped_bytes;
     unsigned long long mem_dump_size;
+    mc_restore_registers regs;
     mc_restore_region *regions;
     size_t region_count;
 } mc_restore_plan;
@@ -172,6 +204,90 @@ static int mc_copy_snapshot_id(char *destination, size_t destination_size, const
 }
 
 /*
+ * Mengisi satu field register berdasarkan pasangan `kunci=nilai` dari
+ * `regs.dump`. Format file ini sama dengan yang ditulis oleh command `freeze`,
+ * sehingga parser cukup mengikuti nama register yang sudah ada.
+ */
+static int mc_parse_register_field(mc_restore_registers *regs, const char *key, const char *value)
+{
+    unsigned long long parsed_value = 0;
+
+    if (strcmp(key, "r15") == 0 || strcmp(key, "r14") == 0 || strcmp(key, "r13") == 0 ||
+        strcmp(key, "r12") == 0 || strcmp(key, "rbp") == 0 || strcmp(key, "rbx") == 0 ||
+        strcmp(key, "r11") == 0 || strcmp(key, "r10") == 0 || strcmp(key, "r9") == 0 ||
+        strcmp(key, "r8") == 0 || strcmp(key, "rax") == 0 || strcmp(key, "rcx") == 0 ||
+        strcmp(key, "rdx") == 0 || strcmp(key, "rsi") == 0 || strcmp(key, "rdi") == 0 ||
+        strcmp(key, "orig_rax") == 0 || strcmp(key, "rip") == 0 || strcmp(key, "cs") == 0 ||
+        strcmp(key, "eflags") == 0 || strcmp(key, "rsp") == 0 || strcmp(key, "ss") == 0 ||
+        strcmp(key, "fs_base") == 0 || strcmp(key, "gs_base") == 0 || strcmp(key, "ds") == 0 ||
+        strcmp(key, "es") == 0 || strcmp(key, "fs") == 0 || strcmp(key, "gs") == 0) {
+        if (mc_parse_ull_value(value, &parsed_value) != 0) {
+            return -1;
+        }
+    } else {
+        return 1;
+    }
+
+    if (strcmp(key, "r15") == 0) {
+        regs->r15 = parsed_value;
+    } else if (strcmp(key, "r14") == 0) {
+        regs->r14 = parsed_value;
+    } else if (strcmp(key, "r13") == 0) {
+        regs->r13 = parsed_value;
+    } else if (strcmp(key, "r12") == 0) {
+        regs->r12 = parsed_value;
+    } else if (strcmp(key, "rbp") == 0) {
+        regs->rbp = parsed_value;
+    } else if (strcmp(key, "rbx") == 0) {
+        regs->rbx = parsed_value;
+    } else if (strcmp(key, "r11") == 0) {
+        regs->r11 = parsed_value;
+    } else if (strcmp(key, "r10") == 0) {
+        regs->r10 = parsed_value;
+    } else if (strcmp(key, "r9") == 0) {
+        regs->r9 = parsed_value;
+    } else if (strcmp(key, "r8") == 0) {
+        regs->r8 = parsed_value;
+    } else if (strcmp(key, "rax") == 0) {
+        regs->rax = parsed_value;
+    } else if (strcmp(key, "rcx") == 0) {
+        regs->rcx = parsed_value;
+    } else if (strcmp(key, "rdx") == 0) {
+        regs->rdx = parsed_value;
+    } else if (strcmp(key, "rsi") == 0) {
+        regs->rsi = parsed_value;
+    } else if (strcmp(key, "rdi") == 0) {
+        regs->rdi = parsed_value;
+    } else if (strcmp(key, "orig_rax") == 0) {
+        regs->orig_rax = parsed_value;
+    } else if (strcmp(key, "rip") == 0) {
+        regs->rip = parsed_value;
+    } else if (strcmp(key, "cs") == 0) {
+        regs->cs = parsed_value;
+    } else if (strcmp(key, "eflags") == 0) {
+        regs->eflags = parsed_value;
+    } else if (strcmp(key, "rsp") == 0) {
+        regs->rsp = parsed_value;
+    } else if (strcmp(key, "ss") == 0) {
+        regs->ss = parsed_value;
+    } else if (strcmp(key, "fs_base") == 0) {
+        regs->fs_base = parsed_value;
+    } else if (strcmp(key, "gs_base") == 0) {
+        regs->gs_base = parsed_value;
+    } else if (strcmp(key, "ds") == 0) {
+        regs->ds = parsed_value;
+    } else if (strcmp(key, "es") == 0) {
+        regs->es = parsed_value;
+    } else if (strcmp(key, "fs") == 0) {
+        regs->fs = parsed_value;
+    } else if (strcmp(key, "gs") == 0) {
+        regs->gs = parsed_value;
+    }
+
+    return 0;
+}
+
+/*
  * Menambah satu entri region ke rencana restore internal.
  *
  * Struktur ini dipakai agar `restore` tidak hanya mencetak file mentah, tetapi
@@ -189,6 +305,100 @@ static int mc_append_restore_region(mc_restore_plan *plan, const mc_restore_regi
 
     plan->regions = new_regions;
     plan->regions[plan->region_count++] = *region;
+    return 0;
+}
+
+/*
+ * `regs.dump` menyimpan snapshot register CPU dalam bentuk teks `kunci=nilai`.
+ *
+ * Data ini dibaca lebih dulu agar rencana restore tidak hanya mengetahui
+ * susunan memori, tetapi juga titik eksekusi proses yang nanti perlu dipulihkan.
+ */
+static int mc_load_register_dump(const char *path, mc_restore_plan *plan)
+{
+    FILE *file = NULL;
+    char line[512];
+    bool has_dump_kind = false;
+    bool has_pid = false;
+    bool has_rip = false;
+    bool has_rsp = false;
+    bool has_rbp = false;
+
+    file = fopen(path, "r");
+    if (file == NULL) {
+        mc_log_system_error("Gagal membuka regs.dump");
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char key[128];
+        char value[384];
+        int split_status = mc_split_metadata_line(line, key, sizeof(key), value, sizeof(value));
+
+        if (split_status > 0) {
+            continue;
+        }
+        if (split_status < 0) {
+            fclose(file);
+            return -1;
+        }
+
+        if (strcmp(key, "jenis_dump") == 0) {
+            if (strcmp(value, "register_cpu_x86_64") != 0) {
+                fclose(file);
+                mc_log_error("Jenis dump register pada regs.dump tidak didukung.");
+                return -1;
+            }
+            has_dump_kind = true;
+        } else if (strcmp(key, "pid_target") == 0) {
+            pid_t regs_pid = -1;
+
+            if (!mc_parse_pid(value, &regs_pid)) {
+                fclose(file);
+                mc_log_error("Nilai pid_target pada regs.dump tidak valid.");
+                return -1;
+            }
+
+            if (plan->pid_target > 0 && plan->pid_target != regs_pid) {
+                fclose(file);
+                mc_log_error("PID target pada regs.dump tidak cocok dengan metadata checkpoint.");
+                return -1;
+            }
+
+            plan->pid_target = regs_pid;
+            has_pid = true;
+        } else {
+            int parse_status = mc_parse_register_field(&plan->regs, key, value);
+
+            if (parse_status < 0) {
+                fclose(file);
+                mc_log_error("Nilai register pada regs.dump tidak valid.");
+                return -1;
+            }
+
+            if (parse_status == 0) {
+                if (strcmp(key, "rip") == 0) {
+                    has_rip = true;
+                } else if (strcmp(key, "rsp") == 0) {
+                    has_rsp = true;
+                } else if (strcmp(key, "rbp") == 0) {
+                    has_rbp = true;
+                }
+            }
+        }
+    }
+
+    if (fclose(file) != 0) {
+        mc_log_system_error("Gagal menutup regs.dump");
+        return -1;
+    }
+
+    if (!has_dump_kind || !has_pid || !has_rip || !has_rsp || !has_rbp) {
+        mc_log_error("regs.dump belum memuat data register penting yang dibutuhkan.");
+        return -1;
+    }
+
+    plan->regs.loaded = true;
     return 0;
 }
 
@@ -532,7 +742,16 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
     printf("Region terlewati  : %zu\n", plan->skipped_regions);
     printf("Total byte dump   : %llu\n", plan->total_dumped_bytes);
     printf("Ukuran mem.dump   : %llu\n", plan->mem_dump_size);
-    puts("Status restore    : metadata checkpoint valid dan rencana restore awal berhasil disusun.");
+    printf("Register dimuat   : %s\n", plan->regs.loaded ? "ya" : "tidak");
+
+    if (plan->regs.loaded) {
+        printf("RIP checkpoint    : 0x%llx\n", plan->regs.rip);
+        printf("RSP checkpoint    : 0x%llx\n", plan->regs.rsp);
+        printf("RBP checkpoint    : 0x%llx\n", plan->regs.rbp);
+        printf("RAX checkpoint    : 0x%llx\n", plan->regs.rax);
+    }
+
+    puts("Status restore    : metadata dan register checkpoint valid, rencana restore awal berhasil disusun.");
     puts("Catatan           : eksekusi restore belum dijalankan.");
     puts("");
 }
@@ -585,6 +804,15 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * susunan byte di `mem.dump` sebelum ada usaha restore yang lebih jauh.
      */
     if (mc_load_checkpoint_info(checkpoint_info_path, &plan) != 0) {
+        free(plan.regions);
+        return 1;
+    }
+
+    /*
+     * Data register dimuat ke struktur internal agar tahap berikutnya nanti
+     * sudah mengetahui konteks eksekusi proses, bukan hanya isi memorinya.
+     */
+    if (mc_load_register_dump(regs_path, &plan) != 0) {
         free(plan.regions);
         return 1;
     }
