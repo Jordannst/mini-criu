@@ -2,7 +2,7 @@
 
 `mini-criu` adalah project berbasis C yang terinspirasi oleh CRIU (Checkpoint/Restore In Userspace) untuk mengeksplorasi konsep checkpoint dan restore proses di Linux/WSL melalui antarmuka CLI yang terstruktur.
 
-Project ini difokuskan pada eksperimen terarah terhadap mekanisme userspace seperti `ptrace`, pembacaan `/proc/<pid>/maps`, akses `/proc/<pid>/mem`, pengambilan register, dan penyimpanan state sederhana ke dalam direktori checkpoint. Fase saat ini sudah mencakup attach ke target, sinkronisasi stop dengan `waitpid`, pencatatan register CPU awal, parsing peta memori, dan dump byte mentah untuk region memori terpilih. Implementasi restore penuh masih belum selesai.
+Project ini difokuskan pada eksperimen terarah terhadap mekanisme userspace seperti `ptrace`, pembacaan `/proc/<pid>/maps`, akses `/proc/<pid>/mem`, pengambilan register, dan penyimpanan state sederhana ke dalam direktori checkpoint. Saat ini `freeze` membuka satu event snapshot, menahan target tetap berhenti, lalu `dump-memory` melanjutkan snapshot yang sama untuk menulis metadata peta memori dan dump byte mentah. Implementasi restore penuh masih belum selesai.
 
 ## Tujuan Project
 
@@ -117,7 +117,7 @@ mini-criu> restore checkpoints/checkpoint-pid-12345-YYYYMMDD-HHMMSS
 mini-criu> exit
 ```
 
-Saat ini command `freeze` sudah dapat melakukan attach ke target, menunggu target berhenti, mengambil register CPU, dan menulis data awal checkpoint. Command `dump-memory` sudah dapat mem-parse `/proc/<pid>/maps`, membaca byte mentah dari region memori terpilih, lalu menulis `mem.meta` dan `mem.dump`. Command `restore` masih berada pada tahap fondasi implementasi.
+Saat ini command `freeze` membuka snapshot, mengambil register CPU, menulis `regs.dump`, lalu menahan target tetap berhenti selama sesi CLI yang sama. Command `dump-memory` melanjutkan snapshot aktif tersebut, mem-parse `/proc/<pid>/maps`, membaca byte mentah dari region memori terpilih, menulis `mem.meta` dan `mem.dump`, lalu melepaskan target kembali. Command `restore` masih berada pada tahap fondasi implementasi.
 
 ## Batasan Utama
 
@@ -133,7 +133,7 @@ Cakupan `mini-criu` saat ini dibatasi pada kasus yang sengaja dibuat sederhana:
 
 Langkah pengembangan berikutnya yang direncanakan:
 
-1. merapikan konsistensi snapshot antara `freeze` dan `dump-memory`
-2. memperkaya format metadata checkpoint agar lebih mudah dipakai saat restore
-3. membangun alur restore minimal untuk skenario yang terbatas
-4. mengevaluasi validasi tambahan untuk region yang gagal didump atau berubah saat proses berjalan kembali
+1. memperkaya format metadata checkpoint agar lebih mudah dipakai saat restore
+2. membangun alur restore minimal untuk skenario yang terbatas
+3. mengevaluasi validasi tambahan untuk region yang gagal didump
+4. meninjau batasan snapshot untuk kasus proses yang lebih kompleks
