@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 typedef struct {
+    char permissions[MC_REGION_PERMS_LEN];
     unsigned long long start_address;
     unsigned long long end_address;
     unsigned long long dump_offset;
@@ -21,6 +22,12 @@ typedef struct {
     bool dump_complete;
     bool has_dump_bytes;
 } mc_restore_region;
+
+typedef enum {
+    MC_MAP_SKIPPED = 0,
+    MC_MAP_CANDIDATE,
+    MC_MAP_RISKY
+} mc_restore_mapping_kind;
 
 typedef struct {
     unsigned long long r15;
@@ -63,6 +70,11 @@ typedef struct {
 } mc_restore_target;
 
 typedef struct {
+    mc_restore_mapping_kind kind;
+    unsigned long long restore_size;
+} mc_restore_mapping_entry;
+
+typedef struct {
     char checkpoint_dir[PATH_MAX];
     char snapshot_id[MC_SNAPSHOT_ID_LEN];
     pid_t pid_target;
@@ -72,8 +84,13 @@ typedef struct {
     size_t skipped_regions;
     unsigned long long total_dumped_bytes;
     unsigned long long mem_dump_size;
+    size_t mapping_candidate_regions;
+    size_t mapping_risky_regions;
+    size_t mapping_skipped_regions;
+    unsigned long long mapping_candidate_bytes;
     mc_restore_registers regs;
     mc_restore_target target;
+    mc_restore_mapping_entry *mapping_entries;
     mc_restore_region *regions;
     size_t region_count;
 } mc_restore_plan;
@@ -320,6 +337,78 @@ static int mc_append_restore_region(mc_restore_plan *plan, const mc_restore_regi
 
     plan->regions = new_regions;
     plan->regions[plan->region_count++] = *region;
+    return 0;
+}
+
+/*
+ * Menentukan apakah satu region merupakan kandidat remap, harus dilewati, atau
+ * perlu penanganan khusus terlebih dahulu.
+ *
+ * Aturan ini sengaja sederhana:
+ * - kandidat: region dipilih, punya dump lengkap, ukuran dump cocok, dan izin `rw-p`
+ * - berisiko: region dipilih tetapi dump parsial/tidak lengkap atau izinnya tidak cocok
+ * - dilewati: region tidak dipilih atau tidak punya byte dump
+ */
+static mc_restore_mapping_kind mc_classify_mapping_region(const mc_restore_region *region,
+                                                          unsigned long long *restore_size_out)
+{
+    unsigned long long region_size = region->end_address - region->start_address;
+
+    *restore_size_out = region->dumped_size;
+
+    if (!region->selected || !region->has_dump_bytes) {
+        return MC_MAP_SKIPPED;
+    }
+
+    if (!region->dump_complete || region->dumped_size != region_size) {
+        return MC_MAP_RISKY;
+    }
+
+    if (strcmp(region->permissions, "rw-p") != 0) {
+        return MC_MAP_RISKY;
+    }
+
+    return MC_MAP_CANDIDATE;
+}
+
+/*
+ * Membuat rencana mapping restore dari metadata region yang sudah diparsing.
+ *
+ * Rencana ini belum melakukan `mmap`, tetapi sudah menjelaskan region mana
+ * yang realistis untuk dipetakan kembali dan berapa byte yang nantinya perlu
+ * ditulis ke target restore.
+ */
+static int mc_build_restore_mapping_plan(mc_restore_plan *plan)
+{
+    mc_restore_mapping_entry *entries = NULL;
+
+    if (plan->region_count == 0) {
+        return 0;
+    }
+
+    entries = calloc(plan->region_count, sizeof(*entries));
+    if (entries == NULL) {
+        mc_log_error("Gagal mengalokasikan memori untuk rencana mapping restore.");
+        return -1;
+    }
+
+    for (size_t i = 0; i < plan->region_count; ++i) {
+        unsigned long long restore_size = 0;
+
+        entries[i].kind = mc_classify_mapping_region(&plan->regions[i], &restore_size);
+        entries[i].restore_size = restore_size;
+
+        if (entries[i].kind == MC_MAP_CANDIDATE) {
+            ++plan->mapping_candidate_regions;
+            plan->mapping_candidate_bytes += restore_size;
+        } else if (entries[i].kind == MC_MAP_RISKY) {
+            ++plan->mapping_risky_regions;
+        } else {
+            ++plan->mapping_skipped_regions;
+        }
+    }
+
+    plan->mapping_entries = entries;
     return 0;
 }
 
@@ -640,6 +729,15 @@ static int mc_load_memory_metadata(const char *path, mc_restore_plan *plan)
                         mc_log_error("Nilai offset_dump pada mem.meta tidak valid.");
                         return -1;
                     }
+                } else if (strcmp(key, "izin") == 0) {
+                    if (snprintf(current_region.permissions,
+                                 sizeof(current_region.permissions),
+                                 "%s",
+                                 value) >= (int)sizeof(current_region.permissions)) {
+                        fclose(file);
+                        mc_log_error("Nilai izin pada mem.meta terlalu panjang.");
+                        return -1;
+                    }
                 } else if (strcmp(key, "ukuran_dump") == 0) {
                     if (mc_parse_ull_value(value, &current_region.dumped_size) != 0) {
                         fclose(file);
@@ -902,6 +1000,10 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
     printf("Region terlewati  : %zu\n", plan->skipped_regions);
     printf("Total byte dump   : %llu\n", plan->total_dumped_bytes);
     printf("Ukuran mem.dump   : %llu\n", plan->mem_dump_size);
+    printf("Kandidat mapping  : %zu\n", plan->mapping_candidate_regions);
+    printf("Region berisiko   : %zu\n", plan->mapping_risky_regions);
+    printf("Region dilewati   : %zu\n", plan->mapping_skipped_regions);
+    printf("Byte kandidat     : %llu\n", plan->mapping_candidate_bytes);
     printf("Register dimuat   : %s\n", plan->regs.loaded ? "ya" : "tidak");
 
     if (plan->regs.loaded) {
@@ -920,7 +1022,7 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
     }
 
     puts("Status restore    : metadata dan target restore awal sudah disiapkan untuk tahap berikutnya.");
-    puts("Catatan           : memory checkpoint belum dipulihkan, sehingga target belum boleh dijalankan sebagai hasil restore.");
+    puts("Catatan           : rencana mapping sudah disusun, tetapi mmap dan penulisan memori belum dijalankan.");
     puts("");
 }
 
@@ -996,11 +1098,22 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
     }
 
     /*
+     * Setelah metadata memori valid, tool mengubahnya menjadi rencana mapping
+     * sederhana. Tujuannya adalah mengetahui region mana yang paling realistis
+     * untuk dipetakan kembali sebelum benar-benar menyentuh `mmap`.
+     */
+    if (mc_build_restore_mapping_plan(&plan) != 0) {
+        free(plan.regions);
+        return 1;
+    }
+
+    /*
      * Setelah checkpoint dianggap valid, tool mencoba membuat child baru yang
      * nantinya dapat dipakai sebagai wadah restore. Tahap ini berhenti setelah
      * child berhasil dibuat dan dihentikan.
      */
     if (mc_create_restore_target(&plan) != 0) {
+        free(plan.mapping_entries);
         free(plan.regions);
         return 1;
     }
@@ -1011,6 +1124,7 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      */
     if (mc_apply_checkpoint_registers(&plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
+        free(plan.mapping_entries);
         free(plan.regions);
         return 1;
     }
@@ -1026,10 +1140,12 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * target restore yang baru dibuat.
      */
     if (mc_cleanup_restore_target(&plan, true) != 0) {
+        free(plan.mapping_entries);
         free(plan.regions);
         return 1;
     }
 
+    free(plan.mapping_entries);
     free(plan.regions);
     return 0;
 }
