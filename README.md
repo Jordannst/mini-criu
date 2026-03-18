@@ -2,7 +2,7 @@
 
 `mini-criu` adalah project berbasis C yang terinspirasi oleh CRIU (Checkpoint/Restore In Userspace) untuk mengeksplorasi konsep checkpoint dan restore proses di Linux/WSL melalui antarmuka CLI yang terstruktur.
 
-Project ini difokuskan pada eksperimen terarah terhadap mekanisme userspace seperti `ptrace`, pembacaan `/proc/<pid>/maps`, akses `/proc/<pid>/mem`, pengambilan register, dan penyimpanan state sederhana ke dalam direktori checkpoint. Implementasi penuh checkpoint/restore belum selesai, tetapi fondasi CLI, struktur modul, dan target pengujian sudah disiapkan untuk pengembangan bertahap.
+Project ini difokuskan pada eksperimen terarah terhadap mekanisme userspace seperti `ptrace`, pembacaan `/proc/<pid>/maps`, akses `/proc/<pid>/mem`, pengambilan register, dan penyimpanan state sederhana ke dalam direktori checkpoint. Fase saat ini sudah mencakup attach ke target, sinkronisasi stop dengan `waitpid`, serta pencatatan register CPU awal ke direktori checkpoint. Implementasi dump memori dan restore penuh masih belum selesai.
 
 ## Tujuan Project
 
@@ -106,7 +106,7 @@ mini-criu> restore checkpoints/checkpoint-pid-12345-YYYYMMDD-HHMMSS
 mini-criu> exit
 ```
 
-Saat ini command `freeze`, `dump-memory`, dan `restore` masih berada pada tahap fondasi implementasi. Beberapa validasi dasar sudah tersedia, dan `dump-memory` sudah dapat membuat direktori checkpoint sederhana yang berisi metadata.
+Saat ini command `freeze` sudah dapat melakukan attach ke target, menunggu target berhenti, mengambil register CPU, dan menulis data awal checkpoint. Command `dump-memory` dan `restore` masih berada pada tahap fondasi implementasi.
 
 ## Batasan Utama
 
@@ -122,9 +122,7 @@ Cakupan `mini-criu` saat ini dibatasi pada kasus yang sengaja dibuat sederhana:
 
 Langkah pengembangan berikutnya yang direncanakan:
 
-1. menambahkan attach dan stop/wait berbasis `ptrace`
-2. menambahkan pengambilan serta serialisasi register
-3. mem-parse `/proc/<pid>/maps` ke representasi yang lebih terstruktur
-4. membaca region memori dari `/proc/<pid>/mem`
-5. merapikan format metadata checkpoint
-6. membangun alur restore minimal untuk skenario yang terbatas
+1. mem-parse `/proc/<pid>/maps` ke representasi yang lebih terstruktur
+2. membaca region memori dari `/proc/<pid>/mem`
+3. merapikan format metadata checkpoint
+4. membangun alur restore minimal untuk skenario yang terbatas
