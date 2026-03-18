@@ -117,7 +117,7 @@ mini-criu> restore checkpoints/checkpoint-pid-12345-YYYYMMDD-HHMMSS
 mini-criu> exit
 ```
 
-Saat ini command `freeze` sudah dapat melakukan attach ke target, menunggu target berhenti, mengambil register CPU, dan menulis data awal checkpoint. Command `dump-memory` dan `restore` masih berada pada tahap fondasi implementasi.
+Saat ini command `freeze` sudah dapat melakukan attach ke target, menunggu target berhenti, mengambil register CPU, dan menulis data awal checkpoint. Command `dump-memory` sudah dapat mem-parse `/proc/<pid>/maps` dan menulis metadata region memori ke `mem.meta`, tetapi belum membaca byte mentah dari `/proc/<pid>/mem`. Command `restore` masih berada pada tahap fondasi implementasi.
 
 ## Batasan Utama
 
