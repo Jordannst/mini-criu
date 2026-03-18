@@ -1,18 +1,26 @@
 #include "mini_criu.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 typedef struct {
+    char label[MC_REGION_LABEL_LEN];
     char permissions[MC_REGION_PERMS_LEN];
     unsigned long long start_address;
     unsigned long long end_address;
@@ -72,6 +80,12 @@ typedef struct {
 typedef struct {
     mc_restore_mapping_kind kind;
     unsigned long long restore_size;
+    bool writeback_candidate;
+    bool parent_window_active;
+    bool target_window_ready;
+    bool write_attempted;
+    bool write_succeeded;
+    unsigned long long bytes_written;
 } mc_restore_mapping_entry;
 
 typedef struct {
@@ -88,6 +102,11 @@ typedef struct {
     size_t mapping_risky_regions;
     size_t mapping_skipped_regions;
     unsigned long long mapping_candidate_bytes;
+    size_t memory_attempted_regions;
+    size_t memory_written_regions;
+    size_t memory_failed_regions;
+    size_t memory_skipped_regions;
+    unsigned long long memory_written_bytes;
     mc_restore_registers regs;
     mc_restore_target target;
     mc_restore_mapping_entry *mapping_entries;
@@ -409,6 +428,103 @@ static int mc_build_restore_mapping_plan(mc_restore_plan *plan)
     }
 
     plan->mapping_entries = entries;
+    return 0;
+}
+
+/*
+ * Write-back awal dibuat sangat konservatif. Hanya region anonim atau heap
+ * yang dipakai, karena region seperti stack atau data file-backed masih punya
+ * kebutuhan penanganan tambahan sebelum aman untuk dipulihkan.
+ */
+static bool mc_can_attempt_initial_writeback(const mc_restore_region *region,
+                                             const mc_restore_mapping_entry *entry,
+                                             unsigned long long page_size)
+{
+    if (entry->kind != MC_MAP_CANDIDATE || entry->restore_size == 0) {
+        return false;
+    }
+
+    if (strcmp(region->label, "(anonim)") != 0 && strcmp(region->label, "[heap]") != 0) {
+        return false;
+    }
+
+    if ((region->start_address % page_size) != 0 || (entry->restore_size % page_size) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * Sebelum child restore dibuat, parent mencoba membuka "jendela alamat"
+ * anonim pada alamat asli checkpoint. Jika berhasil, child hasil `fork`
+ * akan mewarisi mapping itu dan parent bisa melepas salinannya kembali.
+ *
+ * Cara ini dipilih sebagai langkah paling kecil untuk memulai write-back
+ * memori tanpa langsung membangun injeksi `mmap` jarak jauh yang lebih rumit.
+ */
+static int mc_prepare_parent_restore_windows(mc_restore_plan *plan)
+{
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    unsigned long long page_size = 0;
+
+    if (page_size_long <= 0) {
+        mc_log_error("Ukuran halaman memori sistem tidak tersedia.");
+        return -1;
+    }
+
+    page_size = (unsigned long long)page_size_long;
+
+    for (size_t i = 0; i < plan->region_count; ++i) {
+        void *mapped = NULL;
+        mc_restore_mapping_entry *entry = &plan->mapping_entries[i];
+        const mc_restore_region *region = &plan->regions[i];
+
+        if (!mc_can_attempt_initial_writeback(region, entry, page_size)) {
+            continue;
+        }
+
+        mapped = mmap((void *)(uintptr_t)region->start_address,
+                      (size_t)entry->restore_size,
+                      PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                      -1,
+                      0);
+        if (mapped == MAP_FAILED) {
+            continue;
+        }
+
+        entry->writeback_candidate = true;
+        entry->parent_window_active = true;
+    }
+
+    return 0;
+}
+
+/*
+ * Setelah `fork`, parent tidak lagi memerlukan salinan mapping sementaranya.
+ * Mapping di child tetap ada karena sudah diwariskan saat proses dibuat.
+ */
+static int mc_release_parent_restore_windows(mc_restore_plan *plan, bool mark_target_ready)
+{
+    for (size_t i = 0; i < plan->region_count; ++i) {
+        mc_restore_mapping_entry *entry = &plan->mapping_entries[i];
+
+        if (!entry->parent_window_active) {
+            continue;
+        }
+
+        if (munmap((void *)(uintptr_t)plan->regions[i].start_address, (size_t)entry->restore_size) != 0) {
+            mc_log_system_error("Gagal melepas mapping sementara di parent");
+            return -1;
+        }
+
+        entry->parent_window_active = false;
+        if (mark_target_ready) {
+            entry->target_window_ready = true;
+        }
+    }
+
     return 0;
 }
 
@@ -738,6 +854,15 @@ static int mc_load_memory_metadata(const char *path, mc_restore_plan *plan)
                         mc_log_error("Nilai izin pada mem.meta terlalu panjang.");
                         return -1;
                     }
+                } else if (strcmp(key, "label") == 0) {
+                    if (snprintf(current_region.label,
+                                 sizeof(current_region.label),
+                                 "%s",
+                                 value) >= (int)sizeof(current_region.label)) {
+                        fclose(file);
+                        mc_log_error("Nilai label pada mem.meta terlalu panjang.");
+                        return -1;
+                    }
                 } else if (strcmp(key, "ukuran_dump") == 0) {
                     if (mc_parse_ull_value(value, &current_region.dumped_size) != 0) {
                         fclose(file);
@@ -850,6 +975,7 @@ static int mc_create_restore_target(mc_restore_plan *plan)
     pid_t child_pid = fork();
 
     if (child_pid < 0) {
+        mc_release_parent_restore_windows(plan, false);
         mc_log_system_error("Gagal membuat proses target restore");
         return -1;
     }
@@ -861,6 +987,12 @@ static int mc_create_restore_target(mc_restore_plan *plan)
         raise(SIGSTOP);
         pause();
         _exit(0);
+    }
+
+    if (mc_release_parent_restore_windows(plan, true) != 0) {
+        kill(child_pid, SIGKILL);
+        waitpid(child_pid, NULL, 0);
+        return -1;
     }
 
     if (waitpid(child_pid, &wait_status, WUNTRACED) == -1) {
@@ -982,6 +1114,186 @@ static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
 }
 
 /*
+ * Byte mentah dari `mem.dump` ditulis kembali melalui `/proc/<pid>/mem`.
+ *
+ * Tahap ini hanya mencoba region yang sudah:
+ * - lolos klasifikasi kandidat mapping
+ * - punya label yang konservatif untuk langkah awal
+ * - berhasil disiapkan sebagai mapping anonim di child restore
+ *
+ * Dengan batasan ini, tool mulai melakukan write-back nyata tetapi tetap
+ * jujur bahwa hasilnya masih parsial dan belum cukup untuk restore penuh.
+ */
+static int mc_write_memory_back_to_restore_target(const char *mem_dump_path, mc_restore_plan *plan)
+{
+    char target_mem_path[PATH_MAX];
+    unsigned char buffer[16384];
+    int dump_fd = -1;
+    int target_mem_fd = -1;
+
+    if (!plan->target.created || !plan->target.stopped) {
+        mc_log_error("Target restore belum siap untuk write-back memori.");
+        return -1;
+    }
+
+    if (snprintf(target_mem_path,
+                 sizeof(target_mem_path),
+                 "/proc/%d/mem",
+                 plan->target.pid) >= (int)sizeof(target_mem_path)) {
+        mc_log_error("Path memori target restore terlalu panjang.");
+        return -1;
+    }
+
+    dump_fd = open(mem_dump_path, O_RDONLY);
+    if (dump_fd < 0) {
+        mc_log_system_error("Gagal membuka mem.dump");
+        return -1;
+    }
+
+    target_mem_fd = open(target_mem_path, O_RDWR);
+    if (target_mem_fd < 0) {
+        close(dump_fd);
+        mc_log_system_error("Gagal membuka memori target restore");
+        return -1;
+    }
+
+    for (size_t i = 0; i < plan->region_count; ++i) {
+        mc_restore_mapping_entry *entry = &plan->mapping_entries[i];
+        const mc_restore_region *region = &plan->regions[i];
+        unsigned long long written_for_region = 0;
+
+        if (!entry->writeback_candidate || !entry->target_window_ready) {
+            continue;
+        }
+
+        entry->write_attempted = true;
+        ++plan->memory_attempted_regions;
+
+        while (written_for_region < entry->restore_size) {
+            size_t chunk_size = sizeof(buffer);
+            ssize_t bytes_read = 0;
+            ssize_t bytes_written = 0;
+            unsigned long long remaining = entry->restore_size - written_for_region;
+
+            if ((unsigned long long)chunk_size > remaining) {
+                chunk_size = (size_t)remaining;
+            }
+
+            bytes_read = pread(dump_fd,
+                               buffer,
+                               chunk_size,
+                               (off_t)(region->dump_offset + written_for_region));
+            if (bytes_read < 0) {
+                entry->bytes_written = written_for_region;
+                plan->memory_written_bytes += written_for_region;
+                ++plan->memory_failed_regions;
+                close(target_mem_fd);
+                close(dump_fd);
+                mc_log_system_error("Gagal membaca byte region dari mem.dump");
+                return -1;
+            }
+            if ((size_t)bytes_read != chunk_size) {
+                entry->bytes_written = written_for_region;
+                plan->memory_written_bytes += written_for_region;
+                ++plan->memory_failed_regions;
+                close(target_mem_fd);
+                close(dump_fd);
+                mc_log_error("Isi mem.dump lebih pendek dari metadata region.");
+                return -1;
+            }
+
+            bytes_written = pwrite(target_mem_fd,
+                                   buffer,
+                                   chunk_size,
+                                   (off_t)(region->start_address + written_for_region));
+            if (bytes_written < 0) {
+                entry->bytes_written = written_for_region;
+                plan->memory_written_bytes += written_for_region;
+                ++plan->memory_failed_regions;
+                close(target_mem_fd);
+                close(dump_fd);
+                mc_log_system_error("Gagal menulis byte region ke target restore");
+                return -1;
+            }
+            if ((size_t)bytes_written != chunk_size) {
+                entry->bytes_written = written_for_region;
+                plan->memory_written_bytes += written_for_region;
+                ++plan->memory_failed_regions;
+                close(target_mem_fd);
+                close(dump_fd);
+                mc_log_error("Byte yang ditulis ke target restore tidak lengkap.");
+                return -1;
+            }
+
+            written_for_region += (unsigned long long)bytes_written;
+        }
+
+        entry->bytes_written = written_for_region;
+        entry->write_succeeded = true;
+        plan->memory_written_bytes += written_for_region;
+        ++plan->memory_written_regions;
+    }
+
+    if (close(target_mem_fd) != 0) {
+        close(dump_fd);
+        mc_log_system_error("Gagal menutup memori target restore");
+        return -1;
+    }
+
+    if (close(dump_fd) != 0) {
+        mc_log_system_error("Gagal menutup mem.dump");
+        return -1;
+    }
+
+    plan->memory_skipped_regions = plan->mapping_candidate_regions - plan->memory_attempted_regions;
+    return 0;
+}
+
+/*
+ * Detail singkat per region membantu menunjukkan region mana yang benar-benar
+ * dicoba untuk langkah write-back awal, mana yang berhasil, dan mana yang
+ * sengaja dilewati karena belum aman untuk dicoba sekarang.
+ */
+static void mc_print_memory_writeback_details(const mc_restore_plan *plan)
+{
+    bool has_details = false;
+
+    for (size_t i = 0; i < plan->region_count; ++i) {
+        const mc_restore_region *region = &plan->regions[i];
+        const mc_restore_mapping_entry *entry = &plan->mapping_entries[i];
+
+        if (entry->kind != MC_MAP_CANDIDATE) {
+            continue;
+        }
+
+        if (!has_details) {
+            puts("Detail write-back  :");
+            has_details = true;
+        }
+
+        if (entry->write_succeeded) {
+            printf("  region_%zu         berhasil ditulis kembali (%s 0x%llx-0x%llx)\n",
+                   i,
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   region->start_address,
+                   region->end_address);
+        } else if (entry->write_attempted) {
+            printf("  region_%zu         gagal saat write-back (%s 0x%llx-0x%llx)\n",
+                   i,
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   region->start_address,
+                   region->end_address);
+        } else {
+            printf("  region_%zu         dilewati untuk langkah awal (%s 0x%llx-0x%llx)\n",
+                   i,
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   region->start_address,
+                   region->end_address);
+        }
+    }
+}
+
+/*
  * Ringkasan ini menunjukkan bahwa checkpoint berhasil dimuat dan sudah cukup
  * lengkap untuk masuk ke tahap restore berikutnya, walaupun eksekusi restore
  * nyata belum dilakukan.
@@ -1004,6 +1316,11 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
     printf("Region berisiko   : %zu\n", plan->mapping_risky_regions);
     printf("Region dilewati   : %zu\n", plan->mapping_skipped_regions);
     printf("Byte kandidat     : %llu\n", plan->mapping_candidate_bytes);
+    printf("Write-back dicoba : %zu\n", plan->memory_attempted_regions);
+    printf("Write-back berhasil: %zu\n", plan->memory_written_regions);
+    printf("Write-back gagal  : %zu\n", plan->memory_failed_regions);
+    printf("Write-back lewat  : %zu\n", plan->memory_skipped_regions);
+    printf("Byte ditulis balik: %llu\n", plan->memory_written_bytes);
     printf("Register dimuat   : %s\n", plan->regs.loaded ? "ya" : "tidak");
 
     if (plan->regs.loaded) {
@@ -1021,8 +1338,10 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
         printf("Register diterapkan: %s\n", plan->target.regs_apply_succeeded ? "berhasil" : "belum berhasil");
     }
 
+    mc_print_memory_writeback_details(plan);
+
     puts("Status restore    : metadata dan target restore awal sudah disiapkan untuk tahap berikutnya.");
-    puts("Catatan           : rencana mapping sudah disusun, tetapi mmap dan penulisan memori belum dijalankan.");
+    puts("Catatan           : write-back hanya dicoba untuk subset region yang paling aman, jadi restore masih parsial.");
     puts("");
 }
 
@@ -1108,9 +1427,19 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
     }
 
     /*
-     * Setelah checkpoint dianggap valid, tool mencoba membuat child baru yang
-     * nantinya dapat dipakai sebagai wadah restore. Tahap ini berhenti setelah
-     * child berhasil dibuat dan dihentikan.
+     * Parent menyiapkan jendela alamat anonim untuk subset region yang paling
+     * aman. Jendela ini akan diwariskan ke child restore saat `fork`.
+     */
+    if (mc_prepare_parent_restore_windows(&plan) != 0) {
+        free(plan.mapping_entries);
+        free(plan.regions);
+        return 1;
+    }
+
+    /*
+     * Setelah alamat aman disiapkan, tool membuat child baru yang nantinya
+     * dipakai sebagai wadah restore. Child berhenti lebih dulu agar parent
+     * bisa menulis register dan byte memori secara terkontrol.
      */
     if (mc_create_restore_target(&plan) != 0) {
         free(plan.mapping_entries);
@@ -1123,6 +1452,18 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * checkpoint ke target tersebut sebagai langkah awal menuju restore nyata.
      */
     if (mc_apply_checkpoint_registers(&plan) != 0) {
+        mc_cleanup_restore_target(&plan, false);
+        free(plan.mapping_entries);
+        free(plan.regions);
+        return 1;
+    }
+
+    /*
+     * Byte dari `mem.dump` sekarang dicoba ditulis kembali ke subset region
+     * yang paling aman. Tahap ini masih parsial dan tidak berarti seluruh
+     * address space target sudah sama dengan checkpoint.
+     */
+    if (mc_write_memory_back_to_restore_target(mem_dump_path, &plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
         free(plan.mapping_entries);
         free(plan.regions);
