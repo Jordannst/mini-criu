@@ -94,6 +94,24 @@ typedef struct {
 } mc_restore_target;
 
 typedef struct {
+    bool available;
+    bool has_runtime_regs;
+    bool has_fault_address;
+    bool stack_region_found;
+    bool stack_region_restored;
+    bool stack_region_attempted;
+    unsigned long long rip;
+    unsigned long long rsp;
+    unsigned long long rbp;
+    unsigned long long fault_address;
+    int rip_region_index;
+    int rsp_region_index;
+    int rbp_region_index;
+    int fault_region_index;
+    char likely_cause[256];
+} mc_restore_diagnostics;
+
+typedef struct {
     mc_restore_mapping_kind kind;
     mc_restore_writeback_kind writeback_kind;
     unsigned long long restore_size;
@@ -129,6 +147,7 @@ typedef struct {
     size_t memory_extended_candidate_regions;
     mc_restore_registers regs;
     mc_restore_target target;
+    mc_restore_diagnostics diagnostics;
     mc_restore_mapping_entry *mapping_entries;
     mc_restore_region *regions;
     size_t region_count;
@@ -452,6 +471,154 @@ static int mc_build_restore_mapping_plan(mc_restore_plan *plan)
 
     plan->mapping_entries = entries;
     return 0;
+}
+
+/*
+ * Mencari region checkpoint yang mencakup satu alamat runtime.
+ *
+ * Helper ini dipakai saat diagnosis resume agar alamat seperti RIP, RSP, RBP,
+ * dan alamat fault bisa dikaitkan dengan metadata checkpoint yang sudah ada.
+ */
+static int mc_find_region_index_for_address(const mc_restore_plan *plan, unsigned long long address)
+{
+    for (size_t i = 0; i < plan->region_count; ++i) {
+        if (address >= plan->regions[i].start_address && address < plan->regions[i].end_address) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+/*
+ * Menerjemahkan status restore region ke label singkat yang mudah dibaca
+ * pengguna saat diagnosis crash ditampilkan.
+ */
+static const char *mc_describe_region_restore_state(const mc_restore_plan *plan, int region_index)
+{
+    const mc_restore_mapping_entry *entry = NULL;
+
+    if (region_index < 0 || (size_t)region_index >= plan->region_count) {
+        return "tidak ada di metadata checkpoint";
+    }
+
+    entry = &plan->mapping_entries[region_index];
+
+    if (entry->write_succeeded) {
+        return "sudah ditulis kembali";
+    }
+
+    if (entry->write_attempted) {
+        return "sudah dicoba tetapi belum berhasil";
+    }
+
+    if (entry->kind == MC_MAP_RISKY) {
+        return "ditandai berisiko dan belum dipulihkan";
+    }
+
+    if (entry->kind == MC_MAP_SKIPPED || entry->writeback_kind == MC_WRITEBACK_NONE) {
+        return "dilewati dan belum dipulihkan";
+    }
+
+    return "belum ditulis kembali";
+}
+
+/*
+ * Mengumpulkan konteks crash atau stop setelah resume eksperimen.
+ *
+ * Informasi ini tidak memperbaiki restore, tetapi membantu menjelaskan kenapa
+ * target masih gagal: misalnya RIP mengarah ke region yang belum dipulihkan
+ * atau pointer stack masih berada pada region stack yang sengaja dilewati.
+ */
+static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
+{
+    struct user_regs_struct regs;
+    siginfo_t signal_info;
+    bool has_stack_warning = false;
+    bool has_rip_warning = false;
+    bool has_rsp_warning = false;
+
+    if (!plan->target.created || !plan->target.traced || !plan->target.resume_stopped_again) {
+        return;
+    }
+
+    plan->diagnostics.available = true;
+
+    if (ptrace(PTRACE_GETREGS, plan->target.pid, NULL, &regs) == 0) {
+        plan->diagnostics.has_runtime_regs = true;
+        plan->diagnostics.rip = regs.rip;
+        plan->diagnostics.rsp = regs.rsp;
+        plan->diagnostics.rbp = regs.rbp;
+        plan->diagnostics.rip_region_index = mc_find_region_index_for_address(plan, regs.rip);
+        plan->diagnostics.rsp_region_index = mc_find_region_index_for_address(plan, regs.rsp);
+        plan->diagnostics.rbp_region_index = mc_find_region_index_for_address(plan, regs.rbp);
+    }
+
+    memset(&signal_info, 0, sizeof(signal_info));
+    if (ptrace(PTRACE_GETSIGINFO, plan->target.pid, NULL, &signal_info) == 0) {
+        plan->diagnostics.has_fault_address = true;
+        plan->diagnostics.fault_address = (unsigned long long)(uintptr_t)signal_info.si_addr;
+        plan->diagnostics.fault_region_index =
+            mc_find_region_index_for_address(plan, plan->diagnostics.fault_address);
+    }
+
+    for (size_t i = 0; i < plan->region_count; ++i) {
+        if (strcmp(plan->regions[i].label, "[stack]") == 0) {
+            plan->diagnostics.stack_region_found = true;
+            plan->diagnostics.stack_region_attempted = plan->mapping_entries[i].write_attempted;
+            plan->diagnostics.stack_region_restored = plan->mapping_entries[i].write_succeeded;
+            break;
+        }
+    }
+
+    if (plan->diagnostics.stack_region_found && !plan->diagnostics.stack_region_restored) {
+        has_stack_warning = true;
+    }
+
+    if (plan->diagnostics.rip_region_index >= 0 &&
+        !plan->mapping_entries[plan->diagnostics.rip_region_index].write_succeeded) {
+        has_rip_warning = true;
+    }
+
+    if (plan->diagnostics.rsp_region_index >= 0 &&
+        !plan->mapping_entries[plan->diagnostics.rsp_region_index].write_succeeded) {
+        has_rsp_warning = true;
+    }
+
+    if (plan->target.resume_signal == SIGSEGV) {
+        if (has_stack_warning && has_rip_warning) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "RIP mengarah ke region yang belum dipulihkan dan stack checkpoint juga masih belum dipulihkan.");
+        } else if (has_stack_warning && has_rsp_warning) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "Pointer stack masih berada di region stack yang belum dipulihkan.");
+        } else if (has_rip_warning) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "RIP mengarah ke region yang belum dipulihkan pada target restore.");
+        } else if (plan->diagnostics.has_fault_address &&
+                   plan->diagnostics.fault_region_index < 0) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "Alamat fault berada di luar region checkpoint yang berhasil dimuat.");
+        } else {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "State register dan memori target masih belum cukup konsisten untuk melanjutkan eksekusi.");
+        }
+    } else {
+        snprintf(plan->diagnostics.likely_cause,
+                 sizeof(plan->diagnostics.likely_cause),
+                 "%s",
+                 "Target berhenti lagi setelah resume, tetapi penyebab detailnya masih terbatas pada observasi dasar.");
+    }
 }
 
 /*
@@ -1235,6 +1402,7 @@ static int mc_run_controlled_resume_experiment(mc_restore_plan *plan)
             plan->target.stopped = true;
             plan->target.resume_stopped_again = true;
             plan->target.resume_signal = WSTOPSIG(wait_status);
+            mc_collect_resume_diagnostics(plan);
             snprintf(plan->target.resume_note,
                      sizeof(plan->target.resume_note),
                      "target berhenti lagi oleh sinyal %d",
@@ -1484,6 +1652,83 @@ static void mc_print_memory_writeback_details(const mc_restore_plan *plan)
 }
 
 /*
+ * Ringkasan diagnosis ini membantu menjelaskan kenapa target gagal lanjut
+ * berjalan setelah resume eksperimen. Fokusnya adalah mengaitkan alamat
+ * runtime dengan region checkpoint yang berhasil atau belum berhasil dipulihkan.
+ */
+static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
+{
+    const mc_restore_region *region = NULL;
+
+    if (!plan->diagnostics.available) {
+        return;
+    }
+
+    puts("Diagnostik resume :");
+
+    if (plan->diagnostics.has_runtime_regs) {
+        printf("  RIP saat stop    : 0x%llx\n", plan->diagnostics.rip);
+        if (plan->diagnostics.rip_region_index >= 0) {
+            region = &plan->regions[plan->diagnostics.rip_region_index];
+            printf("  Region RIP       : %s (%s)\n",
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   mc_describe_region_restore_state(plan, plan->diagnostics.rip_region_index));
+        } else {
+            puts("  Region RIP       : tidak ditemukan di metadata checkpoint");
+        }
+
+        printf("  RSP saat stop    : 0x%llx\n", plan->diagnostics.rsp);
+        if (plan->diagnostics.rsp_region_index >= 0) {
+            region = &plan->regions[plan->diagnostics.rsp_region_index];
+            printf("  Region RSP       : %s (%s)\n",
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   mc_describe_region_restore_state(plan, plan->diagnostics.rsp_region_index));
+        } else {
+            puts("  Region RSP       : tidak ditemukan di metadata checkpoint");
+        }
+
+        printf("  RBP saat stop    : 0x%llx\n", plan->diagnostics.rbp);
+        if (plan->diagnostics.rbp_region_index >= 0) {
+            region = &plan->regions[plan->diagnostics.rbp_region_index];
+            printf("  Region RBP       : %s (%s)\n",
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   mc_describe_region_restore_state(plan, plan->diagnostics.rbp_region_index));
+        } else {
+            puts("  Region RBP       : tidak ditemukan di metadata checkpoint");
+        }
+    } else {
+        puts("  Register runtime : belum berhasil dibaca setelah target berhenti lagi");
+    }
+
+    if (plan->diagnostics.has_fault_address) {
+        printf("  Alamat fault     : 0x%llx\n", plan->diagnostics.fault_address);
+        if (plan->diagnostics.fault_region_index >= 0) {
+            region = &plan->regions[plan->diagnostics.fault_region_index];
+            printf("  Region fault     : %s (%s)\n",
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   mc_describe_region_restore_state(plan, plan->diagnostics.fault_region_index));
+        } else {
+            puts("  Region fault     : tidak ditemukan di metadata checkpoint");
+        }
+    }
+
+    if (plan->diagnostics.stack_region_found) {
+        if (plan->diagnostics.stack_region_restored) {
+            puts("  Status stack     : region stack sudah ditulis kembali");
+        } else if (plan->diagnostics.stack_region_attempted) {
+            puts("  Status stack     : region stack sempat dicoba tetapi belum berhasil");
+        } else {
+            puts("  Status stack     : region stack masih belum dipulihkan");
+        }
+    } else {
+        puts("  Status stack     : region stack tidak ditemukan di metadata checkpoint");
+    }
+
+    printf("  Dugaan utama     : %s\n",
+           plan->diagnostics.likely_cause[0] != '\0' ? plan->diagnostics.likely_cause : "(belum ada)");
+}
+
+/*
  * Ringkasan ini menunjukkan bahwa checkpoint berhasil dimuat dan sudah cukup
  * lengkap untuk masuk ke tahap restore berikutnya, walaupun eksekusi restore
  * nyata belum dilakukan.
@@ -1548,6 +1793,8 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
         printf("Catatan resume    : %s\n",
                plan->target.resume_note[0] != '\0' ? plan->target.resume_note : "(tidak ada)");
     }
+
+    mc_print_resume_diagnostics(plan);
 
     mc_print_memory_writeback_details(plan);
 
