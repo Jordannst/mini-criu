@@ -101,13 +101,23 @@ typedef struct {
     bool available;
     bool has_runtime_regs;
     bool has_fault_address;
+    bool has_signal_code;
     bool stack_region_found;
     bool stack_region_restored;
     bool stack_region_attempted;
+    bool fault_matches_rip;
+    bool fault_matches_rsp;
+    bool fault_matches_rbp;
+    bool fault_low_address;
+    bool rip_low_address;
     unsigned long long rip;
     unsigned long long rsp;
     unsigned long long rbp;
     unsigned long long fault_address;
+    int signal_code;
+    int checkpoint_rip_region_index;
+    int checkpoint_rsp_region_index;
+    int checkpoint_rbp_region_index;
     int rip_region_index;
     int rsp_region_index;
     int rbp_region_index;
@@ -587,6 +597,69 @@ static bool mc_region_is_runtime_ready(const mc_restore_plan *plan, int region_i
 }
 
 /*
+ * Nama sinyal dipakai agar laporan crash lebih mudah dipahami daripada hanya
+ * angka mentah dari kernel.
+ */
+static const char *mc_describe_signal_name(int signal_number)
+{
+    switch (signal_number) {
+    case SIGSEGV:
+        return "SIGSEGV";
+    case SIGBUS:
+        return "SIGBUS";
+    case SIGILL:
+        return "SIGILL";
+    case SIGTRAP:
+        return "SIGTRAP";
+    default:
+        return "sinyal_lain";
+    }
+}
+
+/*
+ * Untuk fault yang datang dari SIGSEGV atau SIGBUS, `si_code` memberi petunjuk
+ * apakah masalah utamanya alamat belum terpetakan atau izin aksesnya salah.
+ */
+static const char *mc_describe_signal_code(int signal_number, int signal_code)
+{
+    if (signal_number == SIGSEGV) {
+        switch (signal_code) {
+        case SEGV_MAPERR:
+            return "SEGV_MAPERR (alamat belum terpetakan)";
+        case SEGV_ACCERR:
+            return "SEGV_ACCERR (izin akses tidak sesuai)";
+        default:
+            return "SIGSEGV dengan kode lain";
+        }
+    }
+
+    if (signal_number == SIGBUS) {
+        switch (signal_code) {
+        case BUS_ADRALN:
+            return "BUS_ADRALN (alamat tidak selaras)";
+        case BUS_ADRERR:
+            return "BUS_ADRERR (alamat fisik tidak valid)";
+        case BUS_OBJERR:
+            return "BUS_OBJERR (objek backing gagal diakses)";
+        default:
+            return "SIGBUS dengan kode lain";
+        }
+    }
+
+    return "kode sinyal tidak dipetakan";
+}
+
+/*
+ * Fault pada alamat yang sangat rendah biasanya menandakan alur eksekusi
+ * keluar dari layout virtual checkpoint, misalnya meloncat ke offset tanpa
+ * basis alamat yang benar.
+ */
+static bool mc_address_looks_low(unsigned long long address)
+{
+    return address < 0x100000ULL;
+}
+
+/*
  * Mengumpulkan konteks crash atau stop setelah resume eksperimen.
  *
  * Informasi ini tidak memperbaiki restore, tetapi membantu menjelaskan kenapa
@@ -600,18 +673,36 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
     bool has_stack_warning = false;
     bool has_rip_warning = false;
     bool has_rsp_warning = false;
+    bool checkpoint_rip_ready = false;
 
     if (!plan->target.created || !plan->target.traced || !plan->target.resume_stopped_again) {
         return;
     }
 
     plan->diagnostics.available = true;
+    plan->diagnostics.checkpoint_rip_region_index = -1;
+    plan->diagnostics.checkpoint_rsp_region_index = -1;
+    plan->diagnostics.checkpoint_rbp_region_index = -1;
+    plan->diagnostics.rip_region_index = -1;
+    plan->diagnostics.rsp_region_index = -1;
+    plan->diagnostics.rbp_region_index = -1;
+    plan->diagnostics.fault_region_index = -1;
+
+    if (plan->regs.loaded) {
+        plan->diagnostics.checkpoint_rip_region_index =
+            mc_find_region_index_for_address(plan, plan->regs.rip);
+        plan->diagnostics.checkpoint_rsp_region_index =
+            mc_find_region_index_for_address(plan, plan->regs.rsp);
+        plan->diagnostics.checkpoint_rbp_region_index =
+            mc_find_region_index_for_address(plan, plan->regs.rbp);
+    }
 
     if (ptrace(PTRACE_GETREGS, plan->target.pid, NULL, &regs) == 0) {
         plan->diagnostics.has_runtime_regs = true;
         plan->diagnostics.rip = regs.rip;
         plan->diagnostics.rsp = regs.rsp;
         plan->diagnostics.rbp = regs.rbp;
+        plan->diagnostics.rip_low_address = mc_address_looks_low(regs.rip);
         plan->diagnostics.rip_region_index = mc_find_region_index_for_address(plan, regs.rip);
         plan->diagnostics.rsp_region_index = mc_find_region_index_for_address(plan, regs.rsp);
         plan->diagnostics.rbp_region_index = mc_find_region_index_for_address(plan, regs.rbp);
@@ -620,9 +711,18 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
     memset(&signal_info, 0, sizeof(signal_info));
     if (ptrace(PTRACE_GETSIGINFO, plan->target.pid, NULL, &signal_info) == 0) {
         plan->diagnostics.has_fault_address = true;
+        plan->diagnostics.has_signal_code = true;
+        plan->diagnostics.signal_code = signal_info.si_code;
         plan->diagnostics.fault_address = (unsigned long long)(uintptr_t)signal_info.si_addr;
+        plan->diagnostics.fault_low_address = mc_address_looks_low(plan->diagnostics.fault_address);
         plan->diagnostics.fault_region_index =
             mc_find_region_index_for_address(plan, plan->diagnostics.fault_address);
+    }
+
+    if (plan->diagnostics.has_runtime_regs && plan->diagnostics.has_fault_address) {
+        plan->diagnostics.fault_matches_rip = (plan->diagnostics.fault_address == plan->diagnostics.rip);
+        plan->diagnostics.fault_matches_rsp = (plan->diagnostics.fault_address == plan->diagnostics.rsp);
+        plan->diagnostics.fault_matches_rbp = (plan->diagnostics.fault_address == plan->diagnostics.rbp);
     }
 
     for (size_t i = 0; i < plan->region_count; ++i) {
@@ -648,8 +748,29 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
         has_rsp_warning = true;
     }
 
+    if (plan->diagnostics.checkpoint_rip_region_index >= 0) {
+        checkpoint_rip_ready =
+            mc_region_is_runtime_ready(plan, plan->diagnostics.checkpoint_rip_region_index);
+    }
+
     if (plan->target.resume_signal == SIGSEGV) {
-        if (has_stack_warning && has_rip_warning) {
+        if (plan->diagnostics.has_fault_address &&
+            plan->diagnostics.fault_matches_rip &&
+            plan->diagnostics.fault_region_index < 0 &&
+            plan->diagnostics.fault_low_address &&
+            checkpoint_rip_ready) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "RIP runtime meloncat ke alamat rendah di luar layout checkpoint, walaupun region eksekusi checkpoint sudah siap. Ini mengarah pada inkonsistensi basis alamat atau alur kontrol setelah resume.");
+        } else if (plan->diagnostics.has_signal_code &&
+                   plan->diagnostics.signal_code == SEGV_ACCERR &&
+                   plan->diagnostics.fault_region_index >= 0) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "Alamat fault berada di region checkpoint yang dikenal, tetapi izin akses runtime region itu tidak cocok dengan operasi yang sedang dilakukan.");
+        } else if (has_stack_warning && has_rip_warning) {
             snprintf(plan->diagnostics.likely_cause,
                      sizeof(plan->diagnostics.likely_cause),
                      "%s",
@@ -1833,6 +1954,14 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
     }
 
     puts("Diagnostik resume :");
+    printf("  Sinyal stop      : %d (%s)\n",
+           plan->target.resume_signal,
+           mc_describe_signal_name(plan->target.resume_signal));
+
+    if (plan->diagnostics.has_signal_code) {
+        printf("  Kode fault       : %s\n",
+               mc_describe_signal_code(plan->target.resume_signal, plan->diagnostics.signal_code));
+    }
 
     if (plan->diagnostics.has_runtime_regs) {
         printf("  RIP saat stop    : 0x%llx\n", plan->diagnostics.rip);
@@ -1864,8 +1993,24 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
         } else {
             puts("  Region RBP       : tidak ditemukan di metadata checkpoint");
         }
+
+        if (plan->diagnostics.rip_low_address) {
+            puts("  Catatan RIP      : alamat RIP runtime sangat rendah dibanding layout checkpoint");
+        }
     } else {
         puts("  Register runtime : belum berhasil dibaca setelah target berhenti lagi");
+    }
+
+    if (plan->regs.loaded) {
+        printf("  RIP checkpoint   : 0x%llx\n", plan->regs.rip);
+        if (plan->diagnostics.checkpoint_rip_region_index >= 0) {
+            region = &plan->regions[plan->diagnostics.checkpoint_rip_region_index];
+            printf("  Region RIP asli  : %s (%s)\n",
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   mc_describe_region_restore_state(plan, plan->diagnostics.checkpoint_rip_region_index));
+        } else {
+            puts("  Region RIP asli  : tidak ditemukan di metadata checkpoint");
+        }
     }
 
     if (plan->diagnostics.has_fault_address) {
@@ -1875,8 +2020,21 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
             printf("  Region fault     : %s (%s)\n",
                    region->label[0] != '\0' ? region->label : "(tanpa label)",
                    mc_describe_region_restore_state(plan, plan->diagnostics.fault_region_index));
+            printf("  Izin region fault: %s\n", region->permissions);
         } else {
             puts("  Region fault     : tidak ditemukan di metadata checkpoint");
+        }
+
+        if (plan->diagnostics.fault_matches_rip) {
+            puts("  Relasi fault     : alamat fault sama dengan RIP runtime");
+        } else if (plan->diagnostics.fault_matches_rsp) {
+            puts("  Relasi fault     : alamat fault sama dengan RSP runtime");
+        } else if (plan->diagnostics.fault_matches_rbp) {
+            puts("  Relasi fault     : alamat fault sama dengan RBP runtime");
+        }
+
+        if (plan->diagnostics.fault_low_address) {
+            puts("  Karakter fault   : alamat fault sangat rendah dan berada di luar layout checkpoint");
         }
     }
 
