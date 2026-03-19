@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -81,6 +82,15 @@ typedef struct {
     bool traced;
     bool regs_apply_attempted;
     bool regs_apply_succeeded;
+    bool resume_attempted;
+    bool resume_completed;
+    bool resume_running_briefly;
+    bool resume_stopped_again;
+    bool resume_exited;
+    bool resume_signaled;
+    int resume_signal;
+    int resume_exit_code;
+    char resume_note[128];
 } mc_restore_target;
 
 typedef struct {
@@ -1091,6 +1101,15 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
     plan->target.traced = false;
     plan->target.regs_apply_attempted = false;
     plan->target.regs_apply_succeeded = false;
+    plan->target.resume_attempted = false;
+    plan->target.resume_completed = false;
+    plan->target.resume_running_briefly = false;
+    plan->target.resume_stopped_again = false;
+    plan->target.resume_exited = false;
+    plan->target.resume_signaled = false;
+    plan->target.resume_signal = 0;
+    plan->target.resume_exit_code = 0;
+    plan->target.resume_note[0] = '\0';
     return 0;
 }
 
@@ -1154,6 +1173,134 @@ static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
     }
 
     plan->target.regs_apply_succeeded = true;
+    return 0;
+}
+
+/*
+ * Eksperimen resume ini sengaja dibuat singkat dan terkontrol.
+ *
+ * Target di-continue sebentar untuk melihat apakah proses:
+ * - langsung berhenti lagi
+ * - keluar
+ * - crash karena sinyal
+ * - atau sempat berjalan singkat lalu dipaksa stop kembali
+ *
+ * Hasilnya hanya dipakai sebagai observasi awal. Ini belum membuktikan bahwa
+ * restore sudah benar atau proses sudah aman dijalankan penuh.
+ */
+static int mc_run_controlled_resume_experiment(mc_restore_plan *plan)
+{
+    const int poll_count = 5;
+    const struct timespec poll_delay = {.tv_sec = 0, .tv_nsec = 50000000L};
+    int wait_status = 0;
+
+    if (!plan->target.created || !plan->target.traced) {
+        mc_log_error("Target restore belum siap untuk eksperimen resume.");
+        return -1;
+    }
+
+    plan->target.resume_attempted = true;
+
+    if (ptrace(PTRACE_CONT, plan->target.pid, NULL, NULL) == -1) {
+        mc_log_system_error("Gagal melanjutkan target restore untuk eksperimen resume");
+        snprintf(plan->target.resume_note,
+                 sizeof(plan->target.resume_note),
+                 "%s",
+                 "gagal menjalankan PTRACE_CONT");
+        return -1;
+    }
+
+    plan->target.stopped = false;
+
+    for (int i = 0; i < poll_count; ++i) {
+        pid_t wait_result = waitpid(plan->target.pid, &wait_status, WNOHANG | WUNTRACED);
+
+        if (wait_result == -1) {
+            mc_log_system_error("Gagal mengamati status target restore setelah resume");
+            snprintf(plan->target.resume_note,
+                     sizeof(plan->target.resume_note),
+                     "%s",
+                     "gagal membaca status target setelah resume");
+            return -1;
+        }
+
+        if (wait_result == 0) {
+            nanosleep(&poll_delay, NULL);
+            continue;
+        }
+
+        plan->target.resume_completed = true;
+
+        if (WIFSTOPPED(wait_status)) {
+            plan->target.stopped = true;
+            plan->target.resume_stopped_again = true;
+            plan->target.resume_signal = WSTOPSIG(wait_status);
+            snprintf(plan->target.resume_note,
+                     sizeof(plan->target.resume_note),
+                     "target berhenti lagi oleh sinyal %d",
+                     plan->target.resume_signal);
+            return 0;
+        }
+
+        if (WIFEXITED(wait_status)) {
+            plan->target.created = false;
+            plan->target.traced = false;
+            plan->target.resume_exited = true;
+            plan->target.resume_exit_code = WEXITSTATUS(wait_status);
+            snprintf(plan->target.resume_note,
+                     sizeof(plan->target.resume_note),
+                     "target keluar dengan kode %d",
+                     plan->target.resume_exit_code);
+            return 0;
+        }
+
+        if (WIFSIGNALED(wait_status)) {
+            plan->target.created = false;
+            plan->target.traced = false;
+            plan->target.resume_signaled = true;
+            plan->target.resume_signal = WTERMSIG(wait_status);
+            snprintf(plan->target.resume_note,
+                     sizeof(plan->target.resume_note),
+                     "target berhenti karena sinyal fatal %d",
+                     plan->target.resume_signal);
+            return 0;
+        }
+    }
+
+    plan->target.resume_running_briefly = true;
+
+    if (kill(plan->target.pid, SIGSTOP) == -1) {
+        mc_log_system_error("Gagal menghentikan kembali target restore setelah resume singkat");
+        snprintf(plan->target.resume_note,
+                 sizeof(plan->target.resume_note),
+                 "%s",
+                 "target sempat berjalan, tetapi gagal dihentikan kembali");
+        return -1;
+    }
+
+    if (waitpid(plan->target.pid, &wait_status, WUNTRACED) == -1) {
+        mc_log_system_error("Gagal menunggu target restore berhenti kembali");
+        snprintf(plan->target.resume_note,
+                 sizeof(plan->target.resume_note),
+                 "%s",
+                 "target sempat berjalan, tetapi status stop akhir tidak terbaca");
+        return -1;
+    }
+
+    if (!WIFSTOPPED(wait_status)) {
+        snprintf(plan->target.resume_note,
+                 sizeof(plan->target.resume_note),
+                 "%s",
+                 "target sempat berjalan, tetapi tidak kembali ke status stop yang diharapkan");
+        return 0;
+    }
+
+    plan->target.stopped = true;
+    plan->target.resume_stopped_again = true;
+    plan->target.resume_signal = WSTOPSIG(wait_status);
+    snprintf(plan->target.resume_note,
+             sizeof(plan->target.resume_note),
+             "target sempat berjalan singkat lalu dihentikan kembali");
     return 0;
 }
 
@@ -1382,11 +1529,30 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
         printf("Register dicoba   : %s\n", plan->target.regs_apply_attempted ? "ya" : "tidak");
         printf("Register diterapkan: %s\n", plan->target.regs_apply_succeeded ? "berhasil" : "belum berhasil");
     }
+    printf("Resume dicoba     : %s\n", plan->target.resume_attempted ? "ya" : "tidak");
+    if (plan->target.resume_attempted) {
+        if (plan->target.resume_signaled) {
+            printf("Hasil resume      : crash oleh sinyal %d\n", plan->target.resume_signal);
+        } else if (plan->target.resume_exited) {
+            printf("Hasil resume      : keluar dengan kode %d\n", plan->target.resume_exit_code);
+        } else if (plan->target.resume_running_briefly && plan->target.resume_stopped_again) {
+            puts("Hasil resume      : sempat berjalan singkat lalu dihentikan kembali");
+        } else if (plan->target.resume_stopped_again) {
+            printf("Hasil resume      : berhenti lagi oleh sinyal %d\n", plan->target.resume_signal);
+        } else if (plan->target.resume_completed) {
+            puts("Hasil resume      : selesai diamati, tetapi hasilnya tidak khas");
+        } else {
+            puts("Hasil resume      : percobaan belum selesai diamati");
+        }
+
+        printf("Catatan resume    : %s\n",
+               plan->target.resume_note[0] != '\0' ? plan->target.resume_note : "(tidak ada)");
+    }
 
     mc_print_memory_writeback_details(plan);
 
     puts("Status restore    : metadata dan target restore awal sudah disiapkan untuk tahap berikutnya.");
-    puts("Catatan           : write-back kini mencakup kandidat aman dan sebagian kandidat tambahan, tetapi restore masih parsial.");
+    puts("Catatan           : resume hanya eksperimen terkontrol setelah restore parsial, bukan bukti restore penuh.");
     puts("");
 }
 
@@ -1509,6 +1675,18 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * address space target sudah sama dengan checkpoint.
      */
     if (mc_write_memory_back_to_restore_target(mem_dump_path, &plan) != 0) {
+        mc_cleanup_restore_target(&plan, false);
+        free(plan.mapping_entries);
+        free(plan.regions);
+        return 1;
+    }
+
+    /*
+     * Setelah register dan sebagian memori ditulis, tool mencoba melanjutkan
+     * target sebentar untuk melihat reaksi awalnya. Hasil eksperimen ini hanya
+     * diamati dan dilaporkan; bukan bukti bahwa restore sudah selesai.
+     */
+    if (mc_run_controlled_resume_experiment(&plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
         free(plan.mapping_entries);
         free(plan.regions);
