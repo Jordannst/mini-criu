@@ -25,6 +25,7 @@ typedef struct {
     char permissions[MC_REGION_PERMS_LEN];
     unsigned long long start_address;
     unsigned long long end_address;
+    unsigned long long file_offset;
     unsigned long long dump_offset;
     unsigned long long dumped_size;
     bool selected;
@@ -42,6 +43,9 @@ typedef enum {
     MC_WRITEBACK_NONE = 0,
     MC_WRITEBACK_SAFE,
     MC_WRITEBACK_EXTENDED
+    ,
+    MC_WRITEBACK_STACK,
+    MC_WRITEBACK_FILE_EXEC
 } mc_restore_writeback_kind;
 
 typedef struct {
@@ -145,6 +149,9 @@ typedef struct {
     unsigned long long memory_written_bytes;
     size_t memory_safe_candidate_regions;
     size_t memory_extended_candidate_regions;
+    size_t memory_stack_candidate_regions;
+    size_t file_mapping_attempted_regions;
+    size_t file_mapping_ready_regions;
     mc_restore_registers regs;
     mc_restore_target target;
     mc_restore_diagnostics diagnostics;
@@ -412,7 +419,7 @@ static mc_restore_mapping_kind mc_classify_mapping_region(const mc_restore_regio
 {
     unsigned long long region_size = region->end_address - region->start_address;
 
-    *restore_size_out = region->dumped_size;
+    *restore_size_out = region_size;
 
     if (!region->selected || !region->has_dump_bytes) {
         return MC_MAP_SKIPPED;
@@ -474,6 +481,27 @@ static int mc_build_restore_mapping_plan(mc_restore_plan *plan)
 }
 
 /*
+ * Izin region dari metadata checkpoint diterjemahkan ke flag `mmap` agar
+ * region executable file-backed bisa dipetakan kembali dari file aslinya.
+ */
+static int mc_region_permissions_to_prot(const char *permissions)
+{
+    int prot = 0;
+
+    if (permissions[0] == 'r') {
+        prot |= PROT_READ;
+    }
+    if (permissions[1] == 'w') {
+        prot |= PROT_WRITE;
+    }
+    if (permissions[2] == 'x') {
+        prot |= PROT_EXEC;
+    }
+
+    return prot;
+}
+
+/*
  * Mencari region checkpoint yang mencakup satu alamat runtime.
  *
  * Helper ini dipakai saat diagnosis resume agar alamat seperti RIP, RSP, RBP,
@@ -504,6 +532,13 @@ static const char *mc_describe_region_restore_state(const mc_restore_plan *plan,
 
     entry = &plan->mapping_entries[region_index];
 
+    if (entry->writeback_kind == MC_WRITEBACK_FILE_EXEC) {
+        if (entry->writeback_candidate && entry->target_window_ready) {
+            return "dipetakan dari file asli";
+        }
+        return "region eksekusi belum berhasil dipetakan";
+    }
+
     if (entry->write_succeeded) {
         return "sudah ditulis kembali";
     }
@@ -521,6 +556,27 @@ static const char *mc_describe_region_restore_state(const mc_restore_plan *plan,
     }
 
     return "belum ditulis kembali";
+}
+
+/*
+ * Diagnosis runtime perlu tahu apakah suatu region sudah cukup siap dipakai
+ * target, baik lewat write-back byte checkpoint maupun lewat mapping file asli.
+ */
+static bool mc_region_is_runtime_ready(const mc_restore_plan *plan, int region_index)
+{
+    const mc_restore_mapping_entry *entry = NULL;
+
+    if (region_index < 0 || (size_t)region_index >= plan->region_count) {
+        return false;
+    }
+
+    entry = &plan->mapping_entries[region_index];
+
+    if (entry->writeback_kind == MC_WRITEBACK_FILE_EXEC) {
+        return entry->writeback_candidate && entry->target_window_ready;
+    }
+
+    return entry->write_succeeded;
 }
 
 /*
@@ -576,12 +632,12 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
     }
 
     if (plan->diagnostics.rip_region_index >= 0 &&
-        !plan->mapping_entries[plan->diagnostics.rip_region_index].write_succeeded) {
+        !mc_region_is_runtime_ready(plan, plan->diagnostics.rip_region_index)) {
         has_rip_warning = true;
     }
 
     if (plan->diagnostics.rsp_region_index >= 0 &&
-        !plan->mapping_entries[plan->diagnostics.rsp_region_index].write_succeeded) {
+        !mc_region_is_runtime_ready(plan, plan->diagnostics.rsp_region_index)) {
         has_rsp_warning = true;
     }
 
@@ -622,13 +678,11 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
 }
 
 /*
- * Klasifikasi write-back dibuat dua tingkat:
+ * Klasifikasi pemulihan dibuat bertahap:
  * - aman: heap atau region anonim private
- * - tambahan terkontrol: region writable private lain yang bukan stack
- *
- * Region stack tetap dilewati karena alamat stack target yang baru masih
- * sangat peka terhadap konteks eksekusi proses dan belum aman untuk dicoba
- * secara lebih luas.
+ * - tambahan terkontrol: region writable private lain
+ * - stack: dicoba secara khusus karena RSP/RBP sangat bergantung padanya
+ * - file-eksekusi: dicoba lewat mapping file asli untuk membantu RIP
  */
 static mc_restore_writeback_kind mc_choose_writeback_kind(const mc_restore_region *region,
                                                           const mc_restore_mapping_entry *entry,
@@ -637,7 +691,7 @@ static mc_restore_writeback_kind mc_choose_writeback_kind(const mc_restore_regio
 {
     *reason_out = "bukan kandidat write-back";
 
-    if (entry->kind != MC_MAP_CANDIDATE || entry->restore_size == 0) {
+    if (entry->restore_size == 0) {
         return MC_WRITEBACK_NONE;
     }
 
@@ -646,18 +700,30 @@ static mc_restore_writeback_kind mc_choose_writeback_kind(const mc_restore_regio
         return MC_WRITEBACK_NONE;
     }
 
-    if (strcmp(region->label, "[stack]") == 0) {
-        *reason_out = "stack masih dilewati pada langkah ini";
-        return MC_WRITEBACK_NONE;
+    if (entry->kind == MC_MAP_CANDIDATE) {
+        if (strcmp(region->label, "[stack]") == 0) {
+            *reason_out = "region stack akan dicoba secara khusus";
+            return MC_WRITEBACK_STACK;
+        }
+
+        if (strcmp(region->label, "(anonim)") == 0 || strcmp(region->label, "[heap]") == 0) {
+            *reason_out = "kandidat aman";
+            return MC_WRITEBACK_SAFE;
+        }
+
+        *reason_out = "kandidat tambahan yang masih dicoba secara terkontrol";
+        return MC_WRITEBACK_EXTENDED;
     }
 
-    if (strcmp(region->label, "(anonim)") == 0 || strcmp(region->label, "[heap]") == 0) {
-        *reason_out = "kandidat aman";
-        return MC_WRITEBACK_SAFE;
+    if (entry->kind == MC_MAP_SKIPPED &&
+        region->label[0] == '/' &&
+        strchr(region->permissions, 'x') != NULL &&
+        (region->file_offset % page_size) == 0) {
+        *reason_out = "region eksekusi file-backed akan dicoba lewat file asli";
+        return MC_WRITEBACK_FILE_EXEC;
     }
 
-    *reason_out = "kandidat tambahan yang masih dicoba secara terkontrol";
-    return MC_WRITEBACK_EXTENDED;
+    return MC_WRITEBACK_NONE;
 }
 
 /*
@@ -685,6 +751,7 @@ static int mc_prepare_parent_restore_windows(mc_restore_plan *plan)
         mc_restore_mapping_entry *entry = &plan->mapping_entries[i];
         const mc_restore_region *region = &plan->regions[i];
         const char *reason = NULL;
+        int mapped_fd = -1;
 
         entry->writeback_kind = mc_choose_writeback_kind(region, entry, page_size, &reason);
         entry->outcome_reason = reason;
@@ -697,16 +764,41 @@ static int mc_prepare_parent_restore_windows(mc_restore_plan *plan)
             ++plan->memory_safe_candidate_regions;
         } else if (entry->writeback_kind == MC_WRITEBACK_EXTENDED) {
             ++plan->memory_extended_candidate_regions;
+        } else if (entry->writeback_kind == MC_WRITEBACK_STACK) {
+            ++plan->memory_stack_candidate_regions;
+        } else if (entry->writeback_kind == MC_WRITEBACK_FILE_EXEC) {
+            ++plan->file_mapping_attempted_regions;
         }
 
-        mapped = mmap((void *)(uintptr_t)region->start_address,
-                      (size_t)entry->restore_size,
-                      PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                      -1,
-                      0);
+        if (entry->writeback_kind == MC_WRITEBACK_FILE_EXEC) {
+            mapped_fd = open(region->label, O_RDONLY);
+            if (mapped_fd < 0) {
+                entry->outcome_reason = "file asli region eksekusi tidak bisa dibuka";
+                continue;
+            }
+
+            mapped = mmap((void *)(uintptr_t)region->start_address,
+                          (size_t)entry->restore_size,
+                          mc_region_permissions_to_prot(region->permissions),
+                          MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+                          mapped_fd,
+                          (off_t)region->file_offset);
+            close(mapped_fd);
+        } else {
+            mapped = mmap((void *)(uintptr_t)region->start_address,
+                          (size_t)entry->restore_size,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                          -1,
+                          0);
+        }
+
         if (mapped == MAP_FAILED) {
-            entry->outcome_reason = "alamat target tidak bisa disiapkan tanpa bentrok";
+            if (entry->writeback_kind == MC_WRITEBACK_FILE_EXEC) {
+                entry->outcome_reason = "region eksekusi tidak bisa dipetakan dari file asli";
+            } else {
+                entry->outcome_reason = "alamat target tidak bisa disiapkan tanpa bentrok";
+            }
             continue;
         }
 
@@ -714,8 +806,13 @@ static int mc_prepare_parent_restore_windows(mc_restore_plan *plan)
         entry->parent_window_active = true;
         if (entry->writeback_kind == MC_WRITEBACK_SAFE) {
             entry->outcome_reason = "kandidat aman siap ditulis kembali";
-        } else {
+        } else if (entry->writeback_kind == MC_WRITEBACK_EXTENDED) {
             entry->outcome_reason = "kandidat tambahan siap dicoba";
+        } else if (entry->writeback_kind == MC_WRITEBACK_STACK) {
+            entry->outcome_reason = "region stack siap dicoba";
+        } else {
+            ++plan->file_mapping_ready_regions;
+            entry->outcome_reason = "region eksekusi berhasil dipetakan dari file asli";
         }
     }
 
@@ -1058,6 +1155,12 @@ static int mc_load_memory_metadata(const char *path, mc_restore_plan *plan)
                     if (mc_parse_ull_value(value, &current_region.end_address) != 0) {
                         fclose(file);
                         mc_log_error("Nilai alamat akhir region pada mem.meta tidak valid.");
+                        return -1;
+                    }
+                } else if (strcmp(key, "offset") == 0) {
+                    if (mc_parse_ull_value(value, &current_region.file_offset) != 0) {
+                        fclose(file);
+                        mc_log_error("Nilai offset file region pada mem.meta tidak valid.");
                         return -1;
                     }
                 } else if (strcmp(key, "offset_dump") == 0) {
@@ -1522,7 +1625,8 @@ static int mc_write_memory_back_to_restore_target(const char *mem_dump_path, mc_
         unsigned long long written_for_region = 0;
         bool region_failed = false;
 
-        if (!entry->writeback_candidate || !entry->target_window_ready) {
+        if (!entry->writeback_candidate || !entry->target_window_ready ||
+            entry->writeback_kind == MC_WRITEBACK_FILE_EXEC) {
             continue;
         }
 
@@ -1583,6 +1687,8 @@ static int mc_write_memory_back_to_restore_target(const char *mem_dump_path, mc_
         entry->write_succeeded = true;
         if (entry->writeback_kind == MC_WRITEBACK_SAFE) {
             entry->outcome_reason = "berhasil ditulis kembali sebagai kandidat aman";
+        } else if (entry->writeback_kind == MC_WRITEBACK_STACK) {
+            entry->outcome_reason = "stack berhasil ditulis kembali";
         } else {
             entry->outcome_reason = "berhasil ditulis kembali sebagai kandidat tambahan";
         }
@@ -1617,7 +1723,7 @@ static void mc_print_memory_writeback_details(const mc_restore_plan *plan)
         const mc_restore_region *region = &plan->regions[i];
         const mc_restore_mapping_entry *entry = &plan->mapping_entries[i];
 
-        if (entry->kind != MC_MAP_CANDIDATE) {
+        if (entry->kind != MC_MAP_CANDIDATE && entry->writeback_kind != MC_WRITEBACK_FILE_EXEC) {
             continue;
         }
 
@@ -1627,9 +1733,20 @@ static void mc_print_memory_writeback_details(const mc_restore_plan *plan)
         }
 
         if (entry->write_succeeded) {
+            const char *jenis = entry->writeback_kind == MC_WRITEBACK_SAFE ? "aman" :
+                                entry->writeback_kind == MC_WRITEBACK_STACK ? "stack" :
+                                "tambahan";
+
             printf("  region_%zu         berhasil (%s, %s 0x%llx-0x%llx)\n",
                    i,
-                   entry->writeback_kind == MC_WRITEBACK_SAFE ? "aman" : "tambahan",
+                   jenis,
+                   region->label[0] != '\0' ? region->label : "(tanpa label)",
+                   region->start_address,
+                   region->end_address);
+        } else if (entry->writeback_kind == MC_WRITEBACK_FILE_EXEC && entry->writeback_candidate) {
+            printf("  region_%zu         siap dari file asli (%s, %s 0x%llx-0x%llx)\n",
+                   i,
+                   entry->outcome_reason != NULL ? entry->outcome_reason : "file-backed",
                    region->label[0] != '\0' ? region->label : "(tanpa label)",
                    region->start_address,
                    region->end_address);
@@ -1753,6 +1870,10 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
     printf("Byte kandidat     : %llu\n", plan->mapping_candidate_bytes);
     printf("Kandidat aman     : %zu\n", plan->memory_safe_candidate_regions);
     printf("Kandidat tambahan : %zu\n", plan->memory_extended_candidate_regions);
+    printf("Kandidat stack    : %zu\n", plan->memory_stack_candidate_regions);
+    printf("File-eksekusi siap: %zu dari %zu\n",
+           plan->file_mapping_ready_regions,
+           plan->file_mapping_attempted_regions);
     printf("Write-back dicoba : %zu\n", plan->memory_attempted_regions);
     printf("Write-back berhasil: %zu\n", plan->memory_written_regions);
     printf("Write-back gagal  : %zu\n", plan->memory_failed_regions);
