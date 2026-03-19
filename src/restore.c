@@ -1,5 +1,6 @@
 #include "mini_criu.h"
 
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -111,6 +112,8 @@ typedef struct {
     bool has_fault_address;
     bool has_signal_code;
     bool has_applied_regs;
+    bool elf_info_loaded;
+    bool executable_is_pie;
     bool stack_region_found;
     bool stack_region_restored;
     bool stack_region_attempted;
@@ -124,6 +127,8 @@ typedef struct {
     bool runtime_rip_equals_checkpoint_image_offset;
     bool runtime_rip_inside_exec_file_window;
     bool runtime_rip_inside_exec_segment_window;
+    bool runtime_rip_matches_elf_entry;
+    bool runtime_rip_near_elf_entry;
     unsigned long long rip;
     unsigned long long rsp;
     unsigned long long rbp;
@@ -134,7 +139,11 @@ typedef struct {
     unsigned long long checkpoint_image_base;
     unsigned long long checkpoint_rip_image_offset;
     unsigned long long checkpoint_rip_segment_offset;
+    unsigned long long elf_entry;
+    unsigned long long checkpoint_rip_after_elf_entry;
+    unsigned long long runtime_rip_to_elf_entry_delta;
     int signal_code;
+    int elf_type;
     int checkpoint_rip_region_index;
     int checkpoint_rsp_region_index;
     int checkpoint_rbp_region_index;
@@ -702,6 +711,51 @@ static bool mc_compute_image_base(const mc_restore_region *region, unsigned long
 }
 
 /*
+ * Header ELF dari file executable asli cukup untuk diagnosis awal: kita bisa
+ * melihat apakah binary tampak sebagai PIE (`ET_DYN`) dan berapa entry offset
+ * yang dipakai loader saat memulai eksekusi.
+ */
+static int mc_load_elf_diagnostics(const char *path, mc_restore_diagnostics *diagnostics)
+{
+    Elf64_Ehdr header;
+    int fd = open(path, O_RDONLY);
+    ssize_t bytes_read = 0;
+
+    if (fd < 0) {
+        return -1;
+    }
+
+    bytes_read = read(fd, &header, sizeof(header));
+    close(fd);
+
+    if (bytes_read != (ssize_t)sizeof(header)) {
+        return -1;
+    }
+
+    if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 || header.e_ident[EI_CLASS] != ELFCLASS64) {
+        return -1;
+    }
+
+    diagnostics->elf_info_loaded = true;
+    diagnostics->elf_type = header.e_type;
+    diagnostics->elf_entry = header.e_entry;
+    diagnostics->executable_is_pie = (header.e_type == ET_DYN);
+    return 0;
+}
+
+static const char *mc_describe_elf_type(int elf_type)
+{
+    switch (elf_type) {
+    case ET_EXEC:
+        return "ET_EXEC";
+    case ET_DYN:
+        return "ET_DYN";
+    default:
+        return "ELF_tidak_dikenal";
+    }
+}
+
+/*
  * Mengumpulkan konteks crash atau stop setelah resume eksperimen.
  *
  * Informasi ini tidak memperbaiki restore, tetapi membantu menjelaskan kenapa
@@ -812,6 +866,13 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
             plan->diagnostics.checkpoint_rip_segment_offset =
                 plan->regs.rip - checkpoint_exec_region->start_address;
 
+            if (mc_load_elf_diagnostics(checkpoint_exec_region->label, &plan->diagnostics) == 0) {
+                if (plan->diagnostics.checkpoint_rip_image_offset >= plan->diagnostics.elf_entry) {
+                    plan->diagnostics.checkpoint_rip_after_elf_entry =
+                        plan->diagnostics.checkpoint_rip_image_offset - plan->diagnostics.elf_entry;
+                }
+            }
+
             if (plan->diagnostics.has_runtime_regs) {
                 plan->diagnostics.runtime_rip_equals_checkpoint_image_offset =
                     (plan->diagnostics.rip == plan->diagnostics.checkpoint_rip_image_offset);
@@ -825,12 +886,46 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
                 plan->diagnostics.runtime_rip_inside_exec_segment_window =
                     (plan->diagnostics.rip <
                      (checkpoint_exec_region->end_address - checkpoint_exec_region->start_address));
+
+                if (plan->diagnostics.elf_info_loaded) {
+                    plan->diagnostics.runtime_rip_matches_elf_entry =
+                        (plan->diagnostics.rip == plan->diagnostics.elf_entry);
+
+                    if (plan->diagnostics.rip >= plan->diagnostics.elf_entry) {
+                        plan->diagnostics.runtime_rip_to_elf_entry_delta =
+                            plan->diagnostics.rip - plan->diagnostics.elf_entry;
+                    } else {
+                        plan->diagnostics.runtime_rip_to_elf_entry_delta =
+                            plan->diagnostics.elf_entry - plan->diagnostics.rip;
+                    }
+
+                    plan->diagnostics.runtime_rip_near_elf_entry =
+                        (plan->diagnostics.runtime_rip_to_elf_entry_delta <= 0x100ULL);
+                }
             }
         }
     }
 
     if (plan->target.resume_signal == SIGSEGV) {
         if (plan->diagnostics.has_applied_regs &&
+            plan->diagnostics.applied_rip_matches_checkpoint &&
+            plan->diagnostics.elf_info_loaded &&
+            plan->diagnostics.executable_is_pie &&
+            plan->diagnostics.runtime_rip_matches_elf_entry) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "RIP checkpoint terpasang benar, tetapi setelah resume target meloncat tepat ke entry ELF pada binary PIE. Ini indikasi sangat kuat bahwa basis load tinggi hilang dan alur kontrol kembali memakai offset image/relokasi.");
+        } else if (plan->diagnostics.has_applied_regs &&
+                   plan->diagnostics.applied_rip_matches_checkpoint &&
+                   plan->diagnostics.elf_info_loaded &&
+                   plan->diagnostics.executable_is_pie &&
+                   plan->diagnostics.runtime_rip_near_elf_entry) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "RIP runtime jatuh sangat dekat dengan entry ELF pada binary PIE. Ini indikasi kuat bahwa basis load tinggi atau konteks relokasi hilang, sehingga alur kontrol kembali ke offset awal image.");
+        } else if (plan->diagnostics.has_applied_regs &&
             plan->diagnostics.applied_rip_matches_checkpoint &&
             plan->diagnostics.has_runtime_regs &&
             !plan->diagnostics.runtime_rip_matches_checkpoint &&
@@ -2167,6 +2262,18 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
             printf("  Offset RIP image : 0x%llx\n", plan->diagnostics.checkpoint_rip_image_offset);
             printf("  Offset RIP segmen: 0x%llx\n", plan->diagnostics.checkpoint_rip_segment_offset);
         }
+
+        if (plan->diagnostics.elf_info_loaded) {
+            printf("  Tipe ELF asli    : %s\n", mc_describe_elf_type(plan->diagnostics.elf_type));
+            printf("  Mode executable  : %s\n",
+                   plan->diagnostics.executable_is_pie ? "indikasi PIE" : "bukan PIE atau belum terdeteksi");
+            printf("  Entry ELF        : 0x%llx\n", plan->diagnostics.elf_entry);
+            printf("  Jarak dari entry : 0x%llx\n", plan->diagnostics.checkpoint_rip_after_elf_entry);
+            if (plan->diagnostics.has_runtime_regs) {
+                printf("  Jarak RIP runtime: 0x%llx dari entry ELF\n",
+                       plan->diagnostics.runtime_rip_to_elf_entry_delta);
+            }
+        }
     }
 
     if (plan->diagnostics.has_fault_address) {
@@ -2196,7 +2303,11 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
 
     if (plan->diagnostics.has_runtime_regs &&
         plan->diagnostics.checkpoint_image_base != 0) {
-        if (plan->diagnostics.runtime_rip_equals_checkpoint_image_offset) {
+        if (plan->diagnostics.runtime_rip_matches_elf_entry) {
+            puts("  Interpretasi RIP : RIP runtime sama persis dengan entry ELF");
+        } else if (plan->diagnostics.runtime_rip_near_elf_entry) {
+            puts("  Interpretasi RIP : RIP runtime sangat dekat dengan entry ELF");
+        } else if (plan->diagnostics.runtime_rip_equals_checkpoint_image_offset) {
             puts("  Interpretasi RIP : RIP runtime sama dengan offset image checkpoint tanpa basis alamat tinggi");
         } else if (plan->diagnostics.runtime_rip_inside_exec_file_window) {
             puts("  Interpretasi RIP : RIP runtime tampak seperti alamat rendah di dalam rentang file eksekusi");
