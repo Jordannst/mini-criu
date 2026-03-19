@@ -87,6 +87,8 @@ typedef struct {
     bool regs_apply_attempted;
     bool regs_apply_succeeded;
     bool regs_apply_verified;
+    bool runtime_base_step_attempted;
+    bool runtime_base_step_verified;
     bool resume_attempted;
     bool resume_completed;
     bool resume_running_briefly;
@@ -98,6 +100,8 @@ typedef struct {
     unsigned long long applied_rip;
     unsigned long long applied_rsp;
     unsigned long long applied_rbp;
+    unsigned long long applied_fs_base;
+    unsigned long long applied_gs_base;
     char resume_note[128];
 } mc_restore_target;
 
@@ -834,7 +838,9 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
             snprintf(plan->diagnostics.likely_cause,
                      sizeof(plan->diagnostics.likely_cause),
                      "%s",
-                     "RIP runtime berubah menjadi offset image checkpoint tanpa basis alamat tinggi. Ini indikasi kuat mismatch basis PIE atau relokasi.");
+                     plan->target.runtime_base_step_verified ?
+                         "RIP runtime berubah menjadi offset image checkpoint tanpa basis alamat tinggi walaupun fs_base/gs_base sudah cocok. Ini indikasi kuat mismatch basis PIE, relokasi, atau konteks loader." :
+                         "RIP runtime berubah menjadi offset image checkpoint tanpa basis alamat tinggi. Ini indikasi kuat mismatch basis PIE atau relokasi.");
         } else if (plan->diagnostics.has_applied_regs &&
             plan->diagnostics.applied_rip_matches_checkpoint &&
             plan->diagnostics.has_runtime_regs &&
@@ -843,7 +849,9 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
             snprintf(plan->diagnostics.likely_cause,
                      sizeof(plan->diagnostics.likely_cause),
                      "%s",
-                     "RIP checkpoint sempat terpasang benar, tetapi setelah resume berubah menjadi alamat rendah yang masih berada pada rentang file eksekusi. Ini mengarah pada mismatch basis PIE/relokasi atau konteks loader.");
+                     plan->target.runtime_base_step_verified ?
+                         "RIP checkpoint sempat terpasang benar, dan fs_base/gs_base juga sudah cocok, tetapi setelah resume berubah menjadi alamat rendah pada rentang file eksekusi. Ini mengarah pada mismatch basis PIE/relokasi atau konteks loader yang lebih dalam." :
+                         "RIP checkpoint sempat terpasang benar, tetapi setelah resume berubah menjadi alamat rendah yang masih berada pada rentang file eksekusi. Ini mengarah pada mismatch basis PIE/relokasi atau konteks loader.");
         } else if (plan->diagnostics.has_fault_address &&
             plan->diagnostics.fault_matches_rip &&
             plan->diagnostics.fault_region_index < 0 &&
@@ -1618,6 +1626,9 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
     plan->target.traced = false;
     plan->target.regs_apply_attempted = false;
     plan->target.regs_apply_succeeded = false;
+    plan->target.regs_apply_verified = false;
+    plan->target.runtime_base_step_attempted = false;
+    plan->target.runtime_base_step_verified = false;
     plan->target.resume_attempted = false;
     plan->target.resume_completed = false;
     plan->target.resume_running_briefly = false;
@@ -1626,6 +1637,11 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
     plan->target.resume_signaled = false;
     plan->target.resume_signal = 0;
     plan->target.resume_exit_code = 0;
+    plan->target.applied_rip = 0;
+    plan->target.applied_rsp = 0;
+    plan->target.applied_rbp = 0;
+    plan->target.applied_fs_base = 0;
+    plan->target.applied_gs_base = 0;
     plan->target.resume_note[0] = '\0';
     return 0;
 }
@@ -1633,10 +1649,11 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
 /*
  * Register checkpoint dihubungkan ke target restore dengan langkah terkecil
  * yang masih bermakna: parent membaca register child saat ini, lalu menimpa
- * register umum dan pointer eksekusi dari checkpoint.
+ * register umum, pointer eksekusi, dan basis TLS/runtime yang paling penting.
  *
- * Register segment dan base tidak disentuh pada tahap ini agar percobaan tetap
- * konservatif. Tanpa pemulihan memori, target memang belum aman untuk dijalankan.
+ * `fs_base` dan `gs_base` ikut diterapkan agar konteks loader/runtime target
+ * lebih dekat ke proses checkpoint. Langkah ini masih terbatas dan belum
+ * berarti loader atau relokasi sudah dipulihkan penuh.
  */
 static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
 {
@@ -1684,6 +1701,9 @@ static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
     target_regs.rip = plan->regs.rip;
     target_regs.eflags = plan->regs.eflags;
     target_regs.rsp = plan->regs.rsp;
+    target_regs.fs_base = plan->regs.fs_base;
+    target_regs.gs_base = plan->regs.gs_base;
+    plan->target.runtime_base_step_attempted = true;
 
     if (ptrace(PTRACE_SETREGS, plan->target.pid, NULL, &target_regs) == -1) {
         mc_log_system_error("Gagal menerapkan register checkpoint ke target restore");
@@ -1702,6 +1722,11 @@ static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
         plan->target.applied_rip = verified_regs.rip;
         plan->target.applied_rsp = verified_regs.rsp;
         plan->target.applied_rbp = verified_regs.rbp;
+        plan->target.applied_fs_base = verified_regs.fs_base;
+        plan->target.applied_gs_base = verified_regs.gs_base;
+        plan->target.runtime_base_step_verified =
+            (verified_regs.fs_base == plan->regs.fs_base &&
+             verified_regs.gs_base == plan->regs.gs_base);
     }
 
     return 0;
@@ -2115,6 +2140,17 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
                    "tidak cocok dengan checkpoint");
     }
 
+    if (plan->target.runtime_base_step_attempted) {
+        printf("  Langkah basis    : %s\n",
+               "fs_base/gs_base checkpoint ikut diterapkan");
+        printf("  FS base target   : 0x%llx\n", plan->target.applied_fs_base);
+        printf("  GS base target   : 0x%llx\n", plan->target.applied_gs_base);
+        printf("  Status basis TLS : %s\n",
+               plan->target.runtime_base_step_verified ?
+                   "sesuai dengan checkpoint sebelum resume" :
+                   "belum cocok dengan checkpoint");
+    }
+
     if (plan->regs.loaded) {
         printf("  RIP checkpoint   : 0x%llx\n", plan->regs.rip);
         if (plan->diagnostics.checkpoint_rip_region_index >= 0) {
@@ -2166,6 +2202,15 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
             puts("  Interpretasi RIP : RIP runtime tampak seperti alamat rendah di dalam rentang file eksekusi");
         } else if (plan->diagnostics.runtime_rip_inside_exec_segment_window) {
             puts("  Interpretasi RIP : RIP runtime tampak seperti offset kecil terhadap segmen eksekusi");
+        }
+    }
+
+    if (plan->diagnostics.has_runtime_regs) {
+        if (plan->diagnostics.rip_low_address) {
+            printf("  Perilaku RIP     : masih meloncat ke alamat rendah 0x%llx\n",
+                   plan->diagnostics.rip);
+        } else {
+            puts("  Perilaku RIP     : tidak terlihat lompatan ke alamat rendah pada percobaan ini");
         }
     }
 
