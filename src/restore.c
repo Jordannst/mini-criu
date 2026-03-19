@@ -86,6 +86,7 @@ typedef struct {
     bool traced;
     bool regs_apply_attempted;
     bool regs_apply_succeeded;
+    bool regs_apply_verified;
     bool resume_attempted;
     bool resume_completed;
     bool resume_running_briefly;
@@ -94,6 +95,9 @@ typedef struct {
     bool resume_signaled;
     int resume_signal;
     int resume_exit_code;
+    unsigned long long applied_rip;
+    unsigned long long applied_rsp;
+    unsigned long long applied_rbp;
     char resume_note[128];
 } mc_restore_target;
 
@@ -102,6 +106,7 @@ typedef struct {
     bool has_runtime_regs;
     bool has_fault_address;
     bool has_signal_code;
+    bool has_applied_regs;
     bool stack_region_found;
     bool stack_region_restored;
     bool stack_region_attempted;
@@ -110,10 +115,21 @@ typedef struct {
     bool fault_matches_rbp;
     bool fault_low_address;
     bool rip_low_address;
+    bool applied_rip_matches_checkpoint;
+    bool runtime_rip_matches_checkpoint;
+    bool runtime_rip_equals_checkpoint_image_offset;
+    bool runtime_rip_inside_exec_file_window;
+    bool runtime_rip_inside_exec_segment_window;
     unsigned long long rip;
     unsigned long long rsp;
     unsigned long long rbp;
     unsigned long long fault_address;
+    unsigned long long applied_rip;
+    unsigned long long applied_rsp;
+    unsigned long long applied_rbp;
+    unsigned long long checkpoint_image_base;
+    unsigned long long checkpoint_rip_image_offset;
+    unsigned long long checkpoint_rip_segment_offset;
     int signal_code;
     int checkpoint_rip_region_index;
     int checkpoint_rsp_region_index;
@@ -660,6 +676,28 @@ static bool mc_address_looks_low(unsigned long long address)
 }
 
 /*
+ * Untuk executable file-backed, basis image bisa diaproksimasi dari alamat
+ * region saat checkpoint dikurangi offset file region tersebut.
+ */
+static bool mc_compute_image_base(const mc_restore_region *region, unsigned long long *base_out)
+{
+    if (region->label[0] != '/') {
+        return false;
+    }
+
+    if (strchr(region->permissions, 'x') == NULL) {
+        return false;
+    }
+
+    if (region->start_address < region->file_offset) {
+        return false;
+    }
+
+    *base_out = region->start_address - region->file_offset;
+    return true;
+}
+
+/*
  * Mengumpulkan konteks crash atau stop setelah resume eksperimen.
  *
  * Informasi ini tidak memperbaiki restore, tetapi membantu menjelaskan kenapa
@@ -670,6 +708,7 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
 {
     struct user_regs_struct regs;
     siginfo_t signal_info;
+    const mc_restore_region *checkpoint_exec_region = NULL;
     bool has_stack_warning = false;
     bool has_rip_warning = false;
     bool has_rsp_warning = false;
@@ -697,12 +736,22 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
             mc_find_region_index_for_address(plan, plan->regs.rbp);
     }
 
+    if (plan->target.regs_apply_verified) {
+        plan->diagnostics.has_applied_regs = true;
+        plan->diagnostics.applied_rip = plan->target.applied_rip;
+        plan->diagnostics.applied_rsp = plan->target.applied_rsp;
+        plan->diagnostics.applied_rbp = plan->target.applied_rbp;
+        plan->diagnostics.applied_rip_matches_checkpoint =
+            (plan->target.applied_rip == plan->regs.rip);
+    }
+
     if (ptrace(PTRACE_GETREGS, plan->target.pid, NULL, &regs) == 0) {
         plan->diagnostics.has_runtime_regs = true;
         plan->diagnostics.rip = regs.rip;
         plan->diagnostics.rsp = regs.rsp;
         plan->diagnostics.rbp = regs.rbp;
         plan->diagnostics.rip_low_address = mc_address_looks_low(regs.rip);
+        plan->diagnostics.runtime_rip_matches_checkpoint = (regs.rip == plan->regs.rip);
         plan->diagnostics.rip_region_index = mc_find_region_index_for_address(plan, regs.rip);
         plan->diagnostics.rsp_region_index = mc_find_region_index_for_address(plan, regs.rsp);
         plan->diagnostics.rbp_region_index = mc_find_region_index_for_address(plan, regs.rbp);
@@ -749,12 +798,53 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
     }
 
     if (plan->diagnostics.checkpoint_rip_region_index >= 0) {
+        checkpoint_exec_region = &plan->regions[plan->diagnostics.checkpoint_rip_region_index];
         checkpoint_rip_ready =
             mc_region_is_runtime_ready(plan, plan->diagnostics.checkpoint_rip_region_index);
+
+        if (mc_compute_image_base(checkpoint_exec_region, &plan->diagnostics.checkpoint_image_base)) {
+            plan->diagnostics.checkpoint_rip_image_offset =
+                plan->regs.rip - plan->diagnostics.checkpoint_image_base;
+            plan->diagnostics.checkpoint_rip_segment_offset =
+                plan->regs.rip - checkpoint_exec_region->start_address;
+
+            if (plan->diagnostics.has_runtime_regs) {
+                plan->diagnostics.runtime_rip_equals_checkpoint_image_offset =
+                    (plan->diagnostics.rip == plan->diagnostics.checkpoint_rip_image_offset);
+
+                plan->diagnostics.runtime_rip_inside_exec_file_window =
+                    (plan->diagnostics.rip >= checkpoint_exec_region->file_offset &&
+                     plan->diagnostics.rip <
+                         checkpoint_exec_region->file_offset +
+                             (checkpoint_exec_region->end_address - checkpoint_exec_region->start_address));
+
+                plan->diagnostics.runtime_rip_inside_exec_segment_window =
+                    (plan->diagnostics.rip <
+                     (checkpoint_exec_region->end_address - checkpoint_exec_region->start_address));
+            }
+        }
     }
 
     if (plan->target.resume_signal == SIGSEGV) {
-        if (plan->diagnostics.has_fault_address &&
+        if (plan->diagnostics.has_applied_regs &&
+            plan->diagnostics.applied_rip_matches_checkpoint &&
+            plan->diagnostics.has_runtime_regs &&
+            !plan->diagnostics.runtime_rip_matches_checkpoint &&
+            plan->diagnostics.runtime_rip_equals_checkpoint_image_offset) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "RIP runtime berubah menjadi offset image checkpoint tanpa basis alamat tinggi. Ini indikasi kuat mismatch basis PIE atau relokasi.");
+        } else if (plan->diagnostics.has_applied_regs &&
+            plan->diagnostics.applied_rip_matches_checkpoint &&
+            plan->diagnostics.has_runtime_regs &&
+            !plan->diagnostics.runtime_rip_matches_checkpoint &&
+            plan->diagnostics.runtime_rip_inside_exec_file_window) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "RIP checkpoint sempat terpasang benar, tetapi setelah resume berubah menjadi alamat rendah yang masih berada pada rentang file eksekusi. Ini mengarah pada mismatch basis PIE/relokasi atau konteks loader.");
+        } else if (plan->diagnostics.has_fault_address &&
             plan->diagnostics.fault_matches_rip &&
             plan->diagnostics.fault_region_index < 0 &&
             plan->diagnostics.fault_low_address &&
@@ -1551,6 +1641,7 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
 static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
 {
     struct user_regs_struct target_regs;
+    struct user_regs_struct verified_regs;
 
     if (!plan->target.created || !plan->target.traced) {
         mc_log_error("Target restore belum siap untuk penerapan register.");
@@ -1600,6 +1691,19 @@ static int mc_apply_checkpoint_registers(mc_restore_plan *plan)
     }
 
     plan->target.regs_apply_succeeded = true;
+
+    /*
+     * Register dibaca ulang agar diagnosis sesudah resume bisa membedakan
+     * apakah masalahnya berasal dari kegagalan injeksi awal atau dari alur
+     * kontrol yang berubah setelah target dijalankan kembali.
+     */
+    if (ptrace(PTRACE_GETREGS, plan->target.pid, NULL, &verified_regs) == 0) {
+        plan->target.regs_apply_verified = true;
+        plan->target.applied_rip = verified_regs.rip;
+        plan->target.applied_rsp = verified_regs.rsp;
+        plan->target.applied_rbp = verified_regs.rbp;
+    }
+
     return 0;
 }
 
@@ -2001,6 +2105,16 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
         puts("  Register runtime : belum berhasil dibaca setelah target berhenti lagi");
     }
 
+    if (plan->diagnostics.has_applied_regs) {
+        printf("  RIP terpasang    : 0x%llx\n", plan->diagnostics.applied_rip);
+        printf("  RSP terpasang    : 0x%llx\n", plan->diagnostics.applied_rsp);
+        printf("  RBP terpasang    : 0x%llx\n", plan->diagnostics.applied_rbp);
+        printf("  Status injeksi RIP: %s\n",
+               plan->diagnostics.applied_rip_matches_checkpoint ?
+                   "sesuai dengan checkpoint sebelum resume" :
+                   "tidak cocok dengan checkpoint");
+    }
+
     if (plan->regs.loaded) {
         printf("  RIP checkpoint   : 0x%llx\n", plan->regs.rip);
         if (plan->diagnostics.checkpoint_rip_region_index >= 0) {
@@ -2010,6 +2124,12 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
                    mc_describe_region_restore_state(plan, plan->diagnostics.checkpoint_rip_region_index));
         } else {
             puts("  Region RIP asli  : tidak ditemukan di metadata checkpoint");
+        }
+
+        if (plan->diagnostics.checkpoint_image_base != 0) {
+            printf("  Basis image asli : 0x%llx\n", plan->diagnostics.checkpoint_image_base);
+            printf("  Offset RIP image : 0x%llx\n", plan->diagnostics.checkpoint_rip_image_offset);
+            printf("  Offset RIP segmen: 0x%llx\n", plan->diagnostics.checkpoint_rip_segment_offset);
         }
     }
 
@@ -2035,6 +2155,17 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
 
         if (plan->diagnostics.fault_low_address) {
             puts("  Karakter fault   : alamat fault sangat rendah dan berada di luar layout checkpoint");
+        }
+    }
+
+    if (plan->diagnostics.has_runtime_regs &&
+        plan->diagnostics.checkpoint_image_base != 0) {
+        if (plan->diagnostics.runtime_rip_equals_checkpoint_image_offset) {
+            puts("  Interpretasi RIP : RIP runtime sama dengan offset image checkpoint tanpa basis alamat tinggi");
+        } else if (plan->diagnostics.runtime_rip_inside_exec_file_window) {
+            puts("  Interpretasi RIP : RIP runtime tampak seperti alamat rendah di dalam rentang file eksekusi");
+        } else if (plan->diagnostics.runtime_rip_inside_exec_segment_window) {
+            puts("  Interpretasi RIP : RIP runtime tampak seperti offset kecil terhadap segmen eksekusi");
         }
     }
 
