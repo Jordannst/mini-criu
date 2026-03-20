@@ -1,139 +1,197 @@
 # mini-criu
 
-`mini-criu` adalah project berbasis C yang terinspirasi oleh CRIU (Checkpoint/Restore In Userspace) untuk mengeksplorasi konsep checkpoint dan restore proses di Linux/WSL melalui antarmuka CLI yang terstruktur.
+`mini-criu` is a small academic prototype written in C for exploring Linux process checkpoint and partial restore ideas from user space. It is inspired by CRIU, but it is intentionally limited in scope and should be read as a systems-programming study project, not as a CRIU replacement.
 
-Project ini difokuskan pada eksperimen terarah terhadap mekanisme userspace seperti `ptrace`, pembacaan `/proc/<pid>/maps`, akses `/proc/<pid>/mem`, pengambilan register, dan penyimpanan state sederhana ke dalam direktori checkpoint. Saat ini `freeze` membuka satu event snapshot, menahan target tetap berhenti, lalu `dump-memory` melanjutkan snapshot yang sama untuk menulis metadata peta memori dan dump byte mentah. Implementasi restore penuh masih belum selesai.
+The project focuses on a simple CLI workflow around:
 
-## Tujuan Project
+- selecting a target process
+- freezing and snapshotting register state
+- parsing memory metadata from `/proc/<pid>/maps`
+- dumping selected raw memory from `/proc/<pid>/mem`
+- loading a checkpoint back into an experimental restore flow
+- running controlled resume experiments and detailed diagnostics
 
-`mini-criu` dibangun untuk:
+## Overview
 
-- menyediakan fondasi sederhana untuk eksperimen checkpoint/restore proses di Linux
-- memisahkan komponen CLI, utilitas, freeze, dump memori, dan restore ke modul yang jelas
-- menyediakan target dummy yang mudah diuji untuk pengembangan dan observasi perilaku proses
+`mini-criu` exists to make low-level checkpoint/restore ideas easier to study in a small codebase. It explores practical pieces of process state handling such as:
 
-## Struktur Folder
+- `ptrace` attach, stop, register capture, and register injection
+- `/proc/<pid>/maps` parsing
+- `/proc/<pid>/mem` reading and limited write-back
+- checkpoint directory generation and metadata validation
+- experimental restore-target setup and controlled post-restore observation
 
-```text
-mini-criu/
-├── checkpoints/              # Folder checkpoint yang dihasilkan
-├── docs/                     # Catatan desain dan dokumentasi tambahan
-├── include/
-│   └── mini_criu.h           # Tipe bersama dan deklarasi fungsi
-├── src/
-│   ├── main.c                # Entry point program
-│   ├── cli.c                 # Parser command dan loop REPL
-│   ├── freeze.c              # Fondasi logika freeze/checkpoint
-│   ├── memory_dump.c         # Fondasi dump memori
-│   ├── restore.c             # Fondasi restore
-│   └── utils.c               # Helper umum
-├── targets/
-│   ├── cpu_bound_target.c    # Proses target sederhana yang intensif CPU
-│   └── memory_bound_target.c # Proses target sederhana yang intensif memori
-├── Makefile
-├── run-mini-criu             # Launcher untuk menjalankan CLI utama
-└── README.md
-```
+The restore side is still partial. The current code can prepare and probe a restore attempt, but it does not yet achieve stable process resurrection.
+
+## Current Capabilities
+
+The current prototype can:
+
+- choose a target process with `set-target <pid>`
+- freeze the target and capture CPU registers
+- create checkpoint output including:
+  - `checkpoint.info`
+  - `regs.dump`
+  - `mem.meta`
+  - `mem.dump`
+- keep one snapshot event coherent across `freeze` and `dump-memory`
+- parse memory-region metadata and classify restore candidates
+- load and validate an existing checkpoint directory
+- build an internal restore plan from checkpoint metadata
+- create a temporary restore target process
+- inject an early subset of register state
+- prepare executable and file-backed mappings conservatively
+- write back a partial set of memory bytes
+- run a controlled resume experiment
+- print detailed restore diagnostics when the target stops again
+
+## Current Restore Flow
+
+The `restore <checkpoint_dir>` command currently performs an experimental restore-preparation flow:
+
+1. validate the checkpoint directory and required files
+2. load register data and memory metadata
+3. build a restore mapping/write-back plan
+4. create a temporary restore target
+5. apply early register state
+6. prepare or map selected executable and file-backed regions
+7. write back a limited set of memory bytes
+8. run a controlled resume attempt
+9. report diagnostic information if the target stops or crashes
+
+This is useful for studying restore mechanics and failure modes, but it is still not a full restore implementation.
+
+## Current Limitations
+
+Important limitations are still present:
+
+- full stable process resurrection is not achieved
+- restore remains partial and experimental
+- post-resume stack/control-flow inconsistency is still the main blocker
+- file descriptor restoration is not implemented
+- socket restoration is not implemented
+- multithreaded restore is not implemented
+- the project does not attempt production-grade CRIU behavior
+
+In short: checkpoint creation is already useful and concrete, but restore is still best understood as an investigative prototype.
 
 ## Build
 
-Untuk membangun CLI dan program target:
+Build the CLI and example targets with:
 
 ```bash
 make
 ```
 
-Hasil build akan tersedia di dalam folder `build/`:
+Produced binaries:
 
 - `build/mini-criu`
 - `build/targets/cpu_bound_target`
 - `build/targets/memory_bound_target`
 
-Untuk membersihkan hasil build:
+Clean build artifacts with:
 
 ```bash
 make clean
 ```
 
-## Menjalankan Program
+## Run
 
-Cara paling praktis untuk menjalankan CLI:
+Recommended launcher:
 
 ```bash
 ./run-mini-criu
 ```
 
-Launcher ini akan menjalankan `make` otomatis jika binary utama belum tersedia.
-
-Menjalankan CLI langsung dari hasil build:
+Run the CLI directly:
 
 ```bash
 ./build/mini-criu
 ```
 
-Menjalankan satu command tanpa masuk ke mode interaktif:
+Run a single command without entering the interactive shell:
 
 ```bash
-./run-mini-criu status
 ./run-mini-criu help
+./run-mini-criu status
 ./run-mini-criu restore checkpoints/example
 ```
 
-### Command yang Tersedia
+## Commands
 
 - `help`
 - `status`
-- `clear`
-- `/clear`
 - `set-target <pid>`
 - `freeze`
 - `dump-memory`
 - `restore <checkpoint_dir>`
+- `clear`
+- `/clear`
 - `exit`
 
-### Contoh Alur Penggunaan
+## Example Workflow
 
-1. Build project dengan `make`
-2. Jalankan target dummy di terminal lain:
+Start a dummy target in another terminal:
 
 ```bash
 ./build/targets/cpu_bound_target
 ```
 
-3. Jalankan CLI:
+Start the CLI:
 
 ```bash
 ./run-mini-criu
 ```
 
-4. Di dalam CLI:
+Checkpoint flow:
 
 ```text
 mini-criu> set-target 12345
 mini-criu> status
 mini-criu> freeze
 mini-criu> dump-memory
-mini-criu> restore checkpoints/checkpoint-pid-12345-YYYYMMDD-HHMMSS
 mini-criu> exit
 ```
 
-Saat ini command `freeze` membuka snapshot, mengambil register CPU, menulis `regs.dump`, lalu menahan target tetap berhenti selama sesi CLI yang sama. Command `dump-memory` melanjutkan snapshot aktif tersebut, mem-parse `/proc/<pid>/maps`, membaca byte mentah dari region memori terpilih, menulis `mem.meta` dan `mem.dump`, lalu melepaskan target kembali. Command `restore` sekarang dapat memuat checkpoint yang sudah ada, memvalidasi file utama, membaca metadata/register, membuat kerangka target restore sementara, dan mencoba menerapkan state register checkpoint tanpa mengeksekusi restore penuh.
+What happens:
 
-## Batasan Utama
+- `freeze` attaches to the target, captures register state, writes `checkpoint.info` and `regs.dump`, and keeps the target stopped for the active snapshot
+- `dump-memory` continues the same snapshot, writes `mem.meta` and `mem.dump`, then releases the target again
 
-Cakupan `mini-criu` saat ini dibatasi pada kasus yang sengaja dibuat sederhana:
+Restore experiment:
 
-- satu proses
-- target single-threaded
-- belum mencakup restore socket
-- belum mencakup restore file descriptor terbuka
-- belum mengimplementasikan alur checkpoint/restore penuh seperti CRIU
+```bash
+./build/mini-criu restore checkpoints/checkpoint-pid-12345-YYYYMMDD-HHMMSS
+```
 
-## Roadmap
+What the restore command currently does:
 
-Langkah pengembangan berikutnya yang direncanakan:
+- loads and validates checkpoint files
+- prepares a temporary restore target
+- applies early register state
+- performs partial mapping and write-back work
+- attempts a controlled resume
+- prints diagnostic output about the observed failure mode
 
-1. memperkaya format metadata checkpoint agar lebih mudah dipakai saat restore
-2. membangun alur restore minimal untuk skenario yang terbatas
-3. mengevaluasi validasi tambahan untuk region yang gagal didump
-4. meninjau batasan snapshot untuk kasus proses yang lebih kompleks
+## Checkpoint Files
+
+A typical checkpoint directory may contain:
+
+- `checkpoint.info` for high-level checkpoint metadata
+- `regs.dump` for saved CPU register values
+- `mem.meta` for memory-region metadata and dump layout
+- `mem.dump` for raw memory bytes from selected regions
+
+## Repository Layout
+
+- `src/main.c` and `src/cli.c`: CLI entry and command handling
+- `src/freeze.c`: target attach, register capture, and snapshot start
+- `src/memory_dump.c`: memory metadata parsing and raw memory dumping
+- `src/restore.c`: checkpoint loading, restore preparation, experimental resume, and diagnostics
+- `src/utils.c`: shared helpers
+- `targets/`: simple dummy processes for testing
+- `include/mini_criu.h`: shared declarations
+
+## Project Status
+
+`mini-criu` is currently a solid checkpointing prototype with a detailed experimental restore path. It already demonstrates real systems mechanisms and produces meaningful checkpoint artifacts, but restore is still incomplete and unstable after resume. The repository should be read as an academic exploration project that is honest about its current limits.
