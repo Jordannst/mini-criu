@@ -121,11 +121,13 @@ typedef struct {
     bool has_fault_address;
     bool has_signal_code;
     bool has_applied_regs;
+    bool has_stack_snapshot;
     bool elf_info_loaded;
     bool executable_is_pie;
     bool stack_region_found;
     bool stack_region_restored;
     bool stack_region_attempted;
+    bool rsp_points_into_restored_stack;
     bool fault_matches_rip;
     bool fault_matches_rsp;
     bool fault_matches_rbp;
@@ -138,6 +140,12 @@ typedef struct {
     bool runtime_rip_inside_exec_segment_window;
     bool runtime_rip_matches_elf_entry;
     bool runtime_rip_near_elf_entry;
+    bool stack_top_is_null;
+    bool stack_top_low_address;
+    bool stack_top_matches_rip;
+    bool stack_top_matches_fault;
+    bool stack_top_points_into_known_region;
+    bool stack_top_points_into_runtime_ready_region;
     unsigned long long rip;
     unsigned long long rsp;
     unsigned long long rbp;
@@ -151,8 +159,10 @@ typedef struct {
     unsigned long long elf_entry;
     unsigned long long checkpoint_rip_after_elf_entry;
     unsigned long long runtime_rip_to_elf_entry_delta;
+    unsigned long long stack_words[3];
     int signal_code;
     int elf_type;
+    size_t stack_words_read;
     int checkpoint_rip_region_index;
     int checkpoint_rsp_region_index;
     int checkpoint_rbp_region_index;
@@ -160,6 +170,7 @@ typedef struct {
     int rsp_region_index;
     int rbp_region_index;
     int fault_region_index;
+    int stack_top_region_index;
     char likely_cause[256];
 } mc_restore_diagnostics;
 
@@ -737,6 +748,87 @@ static void mc_reset_resume_observation(mc_restore_plan *plan)
     memset(&plan->diagnostics, 0, sizeof(plan->diagnostics));
 }
 
+/*
+ * Saat target berhenti lagi, beberapa word teratas dari stack dibaca secara
+ * read-only. Petunjuk ini membantu membedakan apakah alur kontrol jatuh ke
+ * nol karena alamat balik di stack rusak, atau justru karena jump/call tidak
+ * langsung yang mengambil pointer runtime lain.
+ */
+static bool mc_read_target_word(pid_t pid,
+                                unsigned long long address,
+                                unsigned long long *value_out)
+{
+    long word = 0;
+
+    errno = 0;
+    word = ptrace(PTRACE_PEEKDATA, pid, (void *)(uintptr_t)address, NULL);
+    if (word == -1 && errno != 0) {
+        return false;
+    }
+
+    *value_out = (unsigned long long)(unsigned long)word;
+    return true;
+}
+
+static void mc_collect_stack_transfer_clues(mc_restore_plan *plan)
+{
+    const mc_restore_region *rsp_region = NULL;
+    unsigned long long address = 0;
+
+    if (!plan->target.created || !plan->target.traced || !plan->target.stopped) {
+        return;
+    }
+
+    if (!plan->diagnostics.has_runtime_regs || plan->diagnostics.rsp_region_index < 0) {
+        return;
+    }
+
+    rsp_region = &plan->regions[plan->diagnostics.rsp_region_index];
+    if (strcmp(rsp_region->label, "[stack]") == 0 &&
+        mc_region_is_runtime_ready(plan, plan->diagnostics.rsp_region_index)) {
+        plan->diagnostics.rsp_points_into_restored_stack = true;
+    }
+
+    for (size_t i = 0; i < 3; ++i) {
+        address = plan->diagnostics.rsp + (i * sizeof(unsigned long long));
+        if (address < rsp_region->start_address ||
+            address + sizeof(unsigned long long) > rsp_region->end_address) {
+            break;
+        }
+
+        if (!mc_read_target_word(plan->target.pid, address, &plan->diagnostics.stack_words[i])) {
+            break;
+        }
+
+        ++plan->diagnostics.stack_words_read;
+    }
+
+    if (plan->diagnostics.stack_words_read == 0) {
+        return;
+    }
+
+    plan->diagnostics.has_stack_snapshot = true;
+    plan->diagnostics.stack_top_is_null = (plan->diagnostics.stack_words[0] == 0);
+    plan->diagnostics.stack_top_low_address =
+        mc_address_looks_low(plan->diagnostics.stack_words[0]);
+    plan->diagnostics.stack_top_matches_rip =
+        (plan->diagnostics.stack_words[0] == plan->diagnostics.rip);
+    plan->diagnostics.stack_top_region_index =
+        mc_find_region_index_for_address(plan, plan->diagnostics.stack_words[0]);
+    plan->diagnostics.stack_top_points_into_known_region =
+        (plan->diagnostics.stack_top_region_index >= 0);
+
+    if (plan->diagnostics.has_fault_address) {
+        plan->diagnostics.stack_top_matches_fault =
+            (plan->diagnostics.stack_words[0] == plan->diagnostics.fault_address);
+    }
+
+    if (plan->diagnostics.stack_top_region_index >= 0) {
+        plan->diagnostics.stack_top_points_into_runtime_ready_region =
+            mc_region_is_runtime_ready(plan, plan->diagnostics.stack_top_region_index);
+    }
+}
+
 static bool mc_should_attempt_pie_rebase(const mc_restore_plan *plan)
 {
     return plan->target.created &&
@@ -818,6 +910,7 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
         return;
     }
 
+    memset(&plan->diagnostics, 0, sizeof(plan->diagnostics));
     plan->diagnostics.available = true;
     plan->diagnostics.checkpoint_rip_region_index = -1;
     plan->diagnostics.checkpoint_rsp_region_index = -1;
@@ -826,6 +919,7 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
     plan->diagnostics.rsp_region_index = -1;
     plan->diagnostics.rbp_region_index = -1;
     plan->diagnostics.fault_region_index = -1;
+    plan->diagnostics.stack_top_region_index = -1;
 
     if (plan->regs.loaded) {
         plan->diagnostics.checkpoint_rip_region_index =
@@ -873,6 +967,8 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
         plan->diagnostics.fault_matches_rsp = (plan->diagnostics.fault_address == plan->diagnostics.rsp);
         plan->diagnostics.fault_matches_rbp = (plan->diagnostics.fault_address == plan->diagnostics.rbp);
     }
+
+    mc_collect_stack_transfer_clues(plan);
 
     for (size_t i = 0; i < plan->region_count; ++i) {
         if (strcmp(plan->regions[i].label, "[stack]") == 0) {
@@ -952,10 +1048,36 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
         if (plan->diagnostics.has_fault_address &&
             plan->diagnostics.fault_matches_rip &&
             plan->diagnostics.fault_address == 0) {
-            snprintf(plan->diagnostics.likely_cause,
-                     sizeof(plan->diagnostics.likely_cause),
-                     "%s",
-                     "Sesudah resume, alur kontrol jatuh ke alamat nol. Ini mengarah pada pointer/target kontrol yang tidak valid meskipun basis image sudah dicoba diselaraskan.");
+            if (plan->diagnostics.has_stack_snapshot &&
+                plan->diagnostics.rsp_points_into_restored_stack &&
+                plan->diagnostics.stack_top_is_null) {
+                snprintf(plan->diagnostics.likely_cause,
+                         sizeof(plan->diagnostics.likely_cause),
+                         "%s",
+                         "Sesudah resume, RSP masih berada di stack yang sudah ditulis kembali tetapi nilai teratas stack adalah nol. Ini paling mirip alur return yang mengambil alamat balik null.");
+            } else if (plan->diagnostics.has_stack_snapshot &&
+                       plan->diagnostics.rsp_points_into_restored_stack &&
+                       plan->diagnostics.stack_top_low_address &&
+                       plan->diagnostics.stack_top_matches_fault) {
+                snprintf(plan->diagnostics.likely_cause,
+                         sizeof(plan->diagnostics.likely_cause),
+                         "%s",
+                         "Sesudah resume, nilai teratas stack adalah alamat rendah yang sama dengan fault runtime. Ini paling mirip return ke alamat balik rendah atau tidak valid.");
+            } else if (plan->diagnostics.has_stack_snapshot &&
+                       plan->diagnostics.rsp_points_into_restored_stack &&
+                       !plan->diagnostics.stack_top_matches_fault &&
+                       !plan->diagnostics.stack_top_is_null &&
+                       !plan->diagnostics.stack_top_low_address) {
+                snprintf(plan->diagnostics.likely_cause,
+                         sizeof(plan->diagnostics.likely_cause),
+                         "%s",
+                         "RIP jatuh ke nol, tetapi nilai teratas stack tidak ikut mengarah ke nol. Ini lebih mirip indirect jump/call atau pointer runtime lain yang masih null.");
+            } else {
+                snprintf(plan->diagnostics.likely_cause,
+                         sizeof(plan->diagnostics.likely_cause),
+                         "%s",
+                         "Sesudah resume, alur kontrol jatuh ke alamat nol. Ini mengarah pada pointer/target kontrol yang tidak valid meskipun basis image sudah dicoba diselaraskan.");
+            }
         } else if (plan->diagnostics.has_applied_regs &&
             plan->diagnostics.applied_rip_matches_checkpoint &&
             plan->diagnostics.elf_info_loaded &&
@@ -2405,6 +2527,43 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
 
         if (plan->diagnostics.rip_low_address) {
             puts("  Catatan RIP      : alamat RIP runtime sangat rendah dibanding layout checkpoint");
+        }
+
+        if (plan->diagnostics.rsp_points_into_restored_stack) {
+            puts("  Konteks stack    : RSP berada di region stack yang sudah ditulis kembali");
+        } else if (plan->diagnostics.rsp_region_index >= 0) {
+            puts("  Konteks stack    : RSP berada di region checkpoint, tetapi stack belum sepenuhnya siap");
+        }
+
+        if (plan->diagnostics.has_stack_snapshot) {
+            printf("  Isi [RSP]        : 0x%llx\n", plan->diagnostics.stack_words[0]);
+            if (plan->diagnostics.stack_words_read > 1) {
+                printf("  Isi [RSP+0x8]    : 0x%llx\n", plan->diagnostics.stack_words[1]);
+            }
+            if (plan->diagnostics.stack_words_read > 2) {
+                printf("  Isi [RSP+0x10]   : 0x%llx\n", plan->diagnostics.stack_words[2]);
+            }
+
+            if (plan->diagnostics.stack_top_region_index >= 0) {
+                region = &plan->regions[plan->diagnostics.stack_top_region_index];
+                printf("  Region [RSP]     : %s (%s)\n",
+                       region->label[0] != '\0' ? region->label : "(tanpa label)",
+                       mc_describe_region_restore_state(plan, plan->diagnostics.stack_top_region_index));
+            } else {
+                puts("  Region [RSP]     : nilai teratas stack tidak ada di metadata checkpoint");
+            }
+
+            if (plan->diagnostics.stack_top_is_null) {
+                puts("  Petunjuk stack   : nilai teratas stack adalah nol");
+            } else if (plan->diagnostics.stack_top_matches_fault) {
+                puts("  Petunjuk stack   : nilai teratas stack sama dengan alamat fault");
+            } else if (plan->diagnostics.stack_top_matches_rip) {
+                puts("  Petunjuk stack   : nilai teratas stack sama dengan RIP runtime");
+            } else if (plan->diagnostics.stack_top_low_address) {
+                puts("  Petunjuk stack   : nilai teratas stack adalah alamat rendah");
+            } else if (plan->diagnostics.stack_top_points_into_runtime_ready_region) {
+                puts("  Petunjuk stack   : nilai teratas stack masih mengarah ke region runtime yang siap");
+            }
         }
     } else {
         puts("  Register runtime : belum berhasil dibaca setelah target berhenti lagi");
