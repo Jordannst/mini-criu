@@ -30,10 +30,12 @@ static void mc_print_level(FILE *stream,
 {
     if (mc_stream_supports_color(stream)) {
         fprintf(stream, "%s[%s]%s %s\n", color_code, tag, MC_FMT_RESET, message);
+        fflush(stream);
         return;
     }
 
     fprintf(stream, "[%s] %s\n", tag, message);
+    fflush(stream);
 }
 
 /*
@@ -254,11 +256,13 @@ void mc_print_section(const char *title)
     if (mc_stream_supports_color(stdout)) {
         printf("%s%s%s\n", MC_FMT_BOLD_CYAN, title, MC_FMT_RESET);
         printf("%s------------------------------%s\n", MC_FMT_DIM, MC_FMT_RESET);
+        fflush(stdout);
         return;
     }
 
     puts(title);
     puts("------------------------------");
+    fflush(stdout);
 }
 
 void mc_print_subsection(const char *title)
@@ -266,45 +270,54 @@ void mc_print_subsection(const char *title)
     putchar('\n');
     if (mc_stream_supports_color(stdout)) {
         printf("%s%s%s\n", MC_FMT_BOLD_CYAN, title, MC_FMT_RESET);
+        fflush(stdout);
         return;
     }
 
     puts(title);
+    fflush(stdout);
 }
 
 void mc_print_kv_text(const char *label, const char *value)
 {
     printf("  %-18s : %s\n", label, value);
+    fflush(stdout);
 }
 
 void mc_print_kv_int(const char *label, long long value)
 {
     printf("  %-18s : %lld\n", label, value);
+    fflush(stdout);
 }
 
 void mc_print_kv_size(const char *label, size_t value)
 {
     printf("  %-18s : %zu\n", label, value);
+    fflush(stdout);
 }
 
 void mc_print_kv_u64(const char *label, unsigned long long value)
 {
     printf("  %-18s : %llu\n", label, value);
+    fflush(stdout);
 }
 
 void mc_print_kv_hex(const char *label, unsigned long long value)
 {
     printf("  %-18s : 0x%llx\n", label, value);
+    fflush(stdout);
 }
 
 void mc_print_prompt(void)
 {
     if (mc_stream_supports_color(stdout)) {
         fputs(MC_FMT_BOLD_CYAN "mini-criu>" MC_FMT_RESET " ", stdout);
+        fflush(stdout);
         return;
     }
 
     fputs("mini-criu> ", stdout);
+    fflush(stdout);
 }
 
 /*

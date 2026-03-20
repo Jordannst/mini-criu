@@ -502,6 +502,7 @@ static int mc_append_memory_summary(const char *path,
 
 int mc_dump_memory(mc_context *ctx)
 {
+    char message[160];
     char timestamp[32];
     char checkpoint_dir[PATH_MAX];
     char metadata_path[PATH_MAX];
@@ -552,6 +553,7 @@ int mc_dump_memory(mc_context *ctx)
      * bagian mana yang akan dicatat ke metadata dan bagian mana yang akan
      * dibaca byte mentahnya.
      */
+    mc_log_info("Membaca peta memori target.");
     if (mc_load_memory_regions(ctx->target_pid, &regions, &region_count) != 0) {
         goto cleanup;
     }
@@ -567,6 +569,14 @@ int mc_dump_memory(mc_context *ctx)
         }
     }
 
+    snprintf(message,
+             sizeof(message),
+             "Metadata region siap: %zu region, %zu kandidat dump.",
+             region_count,
+             selected_count);
+    mc_log_ok(message);
+
+    mc_log_info("Menyiapkan file output dump memori.");
     if (mc_prepare_memory_checkpoint_dir(ctx, timestamp, checkpoint_dir, sizeof(checkpoint_dir)) != 0) {
         goto cleanup;
     }
@@ -590,6 +600,7 @@ int mc_dump_memory(mc_context *ctx)
      * `mem.dump` ditulis lebih dulu, lalu `mem.meta` dan `checkpoint.info`
      * diperbarui dengan ukuran serta status hasil dump tersebut.
      */
+    mc_log_info("Menyalin byte memori dari region terpilih.");
     if (mc_dump_selected_regions(ctx->target_pid,
                                  mem_dump_path,
                                  regions,
@@ -600,11 +611,19 @@ int mc_dump_memory(mc_context *ctx)
         goto cleanup;
     }
 
+    snprintf(message,
+             sizeof(message),
+             "Dump mentah selesai: %zu region berhasil, %zu dilewati.",
+             dumped_regions,
+             skipped_regions);
+    mc_log_ok(message);
+
     if (selected_count > 0 && dumped_regions == 0) {
         mc_log_error("Tidak ada region terpilih yang berhasil didump dari /proc/<pid>/mem.");
         goto cleanup;
     }
 
+    mc_log_info("Menulis metadata hasil dump memori.");
     if (mc_write_memory_metadata_file(mem_meta_path,
                                       ctx->target_pid,
                                       ctx->active_snapshot_id,
@@ -629,6 +648,7 @@ int mc_dump_memory(mc_context *ctx)
                                  total_dumped_bytes) != 0) {
         goto cleanup;
     }
+    mc_log_ok("Metadata dump memori berhasil diperbarui.");
 
     mc_log_ok("Metadata dan dump memori berhasil disimpan.");
     mc_print_kv_text("Direktori", checkpoint_dir);

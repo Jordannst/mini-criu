@@ -3208,6 +3208,7 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
 
 int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
 {
+    char message[192];
     char checkpoint_info_path[PATH_MAX];
     char regs_path[PATH_MAX];
     char mem_meta_path[PATH_MAX];
@@ -3236,6 +3237,7 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
         return 1;
     }
 
+    mc_log_info("Memeriksa kelengkapan file checkpoint.");
     if (mc_validate_checkpoint_files(checkpoint_dir,
                                      checkpoint_info_path,
                                      sizeof(checkpoint_info_path),
@@ -3248,6 +3250,7 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
         free(plan.regions);
         return 1;
     }
+    mc_log_ok("File checkpoint lengkap.");
 
     if (snprintf(plan.mem_dump_path, sizeof(plan.mem_dump_path), "%s", mem_dump_path) >=
         (int)sizeof(plan.mem_dump_path)) {
@@ -3260,94 +3263,150 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * Metadata dibaca lebih dulu agar tool memahami identitas snapshot dan
      * susunan byte di `mem.dump` sebelum ada usaha restore yang lebih jauh.
      */
+    mc_log_info("Memuat metadata checkpoint.");
     if (mc_load_checkpoint_info(checkpoint_info_path, &plan) != 0) {
         free(plan.regions);
         return 1;
     }
+    mc_log_ok("Metadata checkpoint berhasil dimuat.");
 
     /*
      * Data register dimuat ke struktur internal agar tahap berikutnya nanti
      * sudah mengetahui konteks eksekusi proses, bukan hanya isi memorinya.
      */
+    mc_log_info("Memuat register checkpoint.");
     if (mc_load_register_dump(regs_path, &plan) != 0) {
         free(plan.regions);
         return 1;
     }
+    mc_log_ok("Register checkpoint berhasil dimuat.");
 
+    mc_log_info("Memuat metadata memori checkpoint.");
     if (mc_load_memory_metadata(mem_meta_path, &plan) != 0) {
         free(plan.regions);
         return 1;
     }
+    snprintf(message,
+             sizeof(message),
+             "Metadata memori siap: %zu region, %zu region didump.",
+             plan.total_regions,
+             plan.dumped_regions);
+    mc_log_ok(message);
 
+    mc_log_info("Memverifikasi ukuran mem.dump.");
     if (mc_validate_dump_size(mem_dump_path, &plan) != 0) {
         free(plan.regions);
         return 1;
     }
+    mc_log_ok("Ukuran mem.dump sesuai dengan metadata.");
 
     /*
      * Setelah metadata memori valid, tool mengubahnya menjadi rencana mapping
      * sederhana. Tujuannya adalah mengetahui region mana yang paling realistis
      * untuk dipetakan kembali sebelum benar-benar menyentuh `mmap`.
      */
+    mc_log_info("Menyusun rencana mapping restore.");
     if (mc_build_restore_mapping_plan(&plan) != 0) {
         free(plan.regions);
         return 1;
     }
+    snprintf(message,
+             sizeof(message),
+             "Rencana mapping siap: %zu kandidat, %zu berisiko.",
+             plan.mapping_candidate_regions,
+             plan.mapping_risky_regions);
+    mc_log_ok(message);
 
     /*
      * Parent menyiapkan jendela alamat anonim untuk subset region yang paling
      * aman. Jendela ini akan diwariskan ke child restore saat `fork`.
      */
+    mc_log_info("Menyiapkan jendela alamat awal untuk target restore.");
     if (mc_prepare_parent_restore_windows(&plan) != 0) {
         free(plan.mapping_entries);
         free(plan.regions);
         return 1;
     }
+    mc_log_ok("Jendela alamat awal siap.");
 
     /*
      * Setelah alamat aman disiapkan, tool membuat child baru yang nantinya
      * dipakai sebagai wadah restore. Child berhenti lebih dulu agar parent
      * bisa menulis register dan byte memori secara terkontrol.
      */
+    mc_log_info("Membuat target restore sementara.");
     if (mc_create_restore_target(&plan) != 0) {
         free(plan.mapping_entries);
         free(plan.regions);
         return 1;
     }
+    snprintf(message,
+             sizeof(message),
+             "Target restore sementara siap dengan PID %d.",
+             plan.target.pid);
+    mc_log_ok(message);
 
     /*
      * Setelah child skeleton tersedia, tool mencoba menerapkan register
      * checkpoint ke target tersebut sebagai langkah awal menuju restore nyata.
      */
+    mc_log_info("Menerapkan register checkpoint ke target restore.");
     if (mc_apply_checkpoint_registers(&plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
         free(plan.mapping_entries);
         free(plan.regions);
         return 1;
     }
+    mc_log_ok("Register awal berhasil diterapkan.");
 
     /*
      * Byte dari `mem.dump` sekarang dicoba ditulis kembali ke subset region
      * yang paling aman. Tahap ini masih parsial dan tidak berarti seluruh
      * address space target sudah sama dengan checkpoint.
      */
+    mc_log_info("Menyiapkan mapping file-backed dan write-back memori.");
     if (mc_write_memory_back_to_restore_target(mem_dump_path, &plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
         free(plan.mapping_entries);
         free(plan.regions);
         return 1;
     }
+    snprintf(message,
+             sizeof(message),
+             "Tahap write-back selesai: %zu region berhasil, %zu gagal, %zu dilewati.",
+             plan.memory_written_regions,
+             plan.memory_failed_regions,
+             plan.memory_skipped_regions);
+    mc_log_ok(message);
 
     /*
      * Setelah register dan sebagian memori ditulis, tool mencoba melanjutkan
      * target sebentar untuk melihat reaksi awalnya. Hasil eksperimen ini hanya
      * diamati dan dilaporkan; bukan bukti bahwa restore sudah selesai.
      */
+    mc_log_info("Menjalankan resume eksperimen secara terkontrol.");
     if (mc_run_controlled_resume_experiment(&plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
         free(plan.mapping_entries);
         free(plan.regions);
         return 1;
+    }
+    if (plan.target.resume_signaled) {
+        snprintf(message,
+                 sizeof(message),
+                 "Target berhenti lagi oleh sinyal %d saat resume eksperimen.",
+                 plan.target.resume_signal);
+        mc_log_warn(message);
+    } else if (plan.target.resume_exited) {
+        snprintf(message,
+                 sizeof(message),
+                 "Target keluar dengan kode %d saat resume eksperimen.",
+                 plan.target.resume_exit_code);
+        mc_log_warn(message);
+    } else if (plan.target.resume_running_briefly && plan.target.resume_stopped_again) {
+        mc_log_warn("Target sempat berjalan singkat lalu dihentikan kembali.");
+    } else if (plan.target.resume_completed) {
+        mc_log_ok("Resume eksperimen selesai diamati.");
     }
 
     /*
@@ -3356,11 +3415,21 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * checkpoint ke RIP rendah tersebut. Hasilnya hanya dipakai sebagai
      * eksperimen, bukan sebagai restore final.
      */
+    mc_log_info("Memeriksa apakah perlu penyelarasan basis PIE.");
     if (mc_attempt_pie_base_realignment(&plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
         free(plan.mapping_entries);
         free(plan.regions);
         return 1;
+    }
+    if (plan.target.pie_rebase_attempted) {
+        if (plan.target.pie_rebase_verified) {
+            mc_log_ok("Percobaan penyelarasan basis PIE berhasil diterapkan.");
+        } else {
+            mc_log_warn("Percobaan penyelarasan basis PIE dilakukan, tetapi belum menstabilkan alur kontrol.");
+        }
+    } else {
+        mc_log_info("Tidak ada langkah basis PIE tambahan yang perlu dicoba.");
     }
 
     snprintf(ctx->last_checkpoint_dir, sizeof(ctx->last_checkpoint_dir), "%s", checkpoint_dir);

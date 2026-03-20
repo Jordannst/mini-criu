@@ -233,6 +233,7 @@ int mc_freeze_target(mc_context *ctx)
     mc_print_section("Ringkasan checkpoint");
     mc_print_kv_int("PID target", ctx->target_pid);
     mc_log_info("Memulai freeze target.");
+    mc_log_info("Melakukan attach ptrace ke target.");
 
     /*
      * Attach membuat target masuk ke mode trace. Setelah itu kita wajib menunggu
@@ -275,10 +276,12 @@ int mc_freeze_target(mc_context *ctx)
      * PTRACE_GETREGS. Data ini menjadi snapshot register yang paling awal dan
      * paling kecil untuk disimpan.
      */
+    mc_log_info("Mengambil snapshot register.");
     if (ptrace(PTRACE_GETREGS, ctx->target_pid, NULL, &regs) == -1) {
         mc_log_system_error("Gagal mengambil register CPU dari target");
         goto cleanup;
     }
+    mc_log_ok("Snapshot register berhasil diambil.");
 
     mc_format_timestamp(timestamp, sizeof(timestamp));
 
@@ -288,6 +291,7 @@ int mc_freeze_target(mc_context *ctx)
      * - `regs.dump` untuk isi register
      * - `checkpoint.info` untuk ringkasan checkpoint
      */
+    mc_log_info("Menyiapkan direktori dan artefak checkpoint.");
     if (mc_prepare_freeze_checkpoint_dir(ctx, timestamp, checkpoint_dir, sizeof(checkpoint_dir)) != 0) {
         goto cleanup;
     }
@@ -309,6 +313,7 @@ int mc_freeze_target(mc_context *ctx)
     if (mc_write_freeze_metadata(metadata_path, ctx->target_pid, timestamp, timestamp, stop_signal, &regs) != 0) {
         goto cleanup;
     }
+    mc_log_ok("Artefak awal checkpoint berhasil disimpan.");
 
     /*
      * Snapshot dinyatakan aktif setelah file register dan metadata awal selesai
