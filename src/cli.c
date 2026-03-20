@@ -107,9 +107,10 @@ static int mc_parse_tokens(int argc, char **argv, mc_command *cmd)
  */
 void mc_print_banner(void)
 {
-    puts("mini-criu");
-    puts("Scaffold prototipe akademik checkpoint/restore untuk proses Linux.");
-    puts("Ketik 'help' untuk melihat perintah yang tersedia.");
+    mc_print_section("mini-criu");
+    puts("  prototipe eksperimental checkpoint/restore untuk proses Linux");
+    puts("  by Jordan & Grantly");
+    puts("  Ketik 'help' untuk melihat perintah yang tersedia.");
 }
 
 /*
@@ -117,17 +118,15 @@ void mc_print_banner(void)
  */
 void mc_print_help(void)
 {
-    puts("");
-    puts("Perintah yang tersedia:");
-    puts("  help                      Menampilkan pesan bantuan ini");
-    puts("  status                    Menampilkan status CLI saat ini");
-    puts("  clear, /clear             Membersihkan tampilan terminal");
-    puts("  set-target <pid>          Memilih proses untuk diperiksa/checkpoint");
-    puts("  freeze                    Memulai snapshot, menyimpan register, dan menahan target tetap stop");
-    puts("  dump-memory               Menyelesaikan snapshot aktif dengan mem.meta dan mem.dump");
-    puts("  restore <checkpoint_dir>  Memuat checkpoint, mencoba register, write-back memori, dan resume eksperimen");
-    puts("  exit                      Keluar dari shell interaktif");
-    puts("");
+    mc_print_section("Perintah tersedia");
+    printf("  %-24s %s\n", "help", "Menampilkan pesan bantuan ini");
+    printf("  %-24s %s\n", "status", "Menampilkan status CLI saat ini");
+    printf("  %-24s %s\n", "clear, /clear", "Membersihkan tampilan terminal");
+    printf("  %-24s %s\n", "set-target <pid>", "Memilih proses untuk diperiksa/checkpoint");
+    printf("  %-24s %s\n", "freeze", "Memulai snapshot, menyimpan register, dan menahan target tetap stop");
+    printf("  %-24s %s\n", "dump-memory", "Menyelesaikan snapshot aktif dengan mem.meta dan mem.dump");
+    printf("  %-24s %s\n", "restore <checkpoint_dir>", "Memuat checkpoint, mencoba register, write-back memori, dan resume eksperimen");
+    printf("  %-24s %s\n", "exit", "Keluar dari shell interaktif");
 }
 
 /*
@@ -136,25 +135,24 @@ void mc_print_help(void)
  */
 void mc_print_status(const mc_context *ctx)
 {
-    puts("");
-    puts("status mini-criu");
-    puts("-----------------");
+    mc_print_section("Status mini-criu");
 
     if (ctx->target_pid > 0) {
-        printf("PID target        : %d\n", ctx->target_pid);
-        printf("Target tersedia   : %s\n", mc_process_exists(ctx->target_pid) ? "ya" : "tidak");
+        mc_print_kv_int("PID target", ctx->target_pid);
+        mc_print_kv_text("Target tersedia", mc_process_exists(ctx->target_pid) ? "ya" : "tidak");
     } else {
-        puts("PID target        : belum diatur");
-        puts("Target tersedia   : n/a");
+        mc_print_kv_text("PID target", "belum diatur");
+        mc_print_kv_text("Target tersedia", "n/a");
     }
 
-    printf("Root checkpoint   : %s\n", ctx->checkpoint_root);
-    printf("Checkpoint akhir  : %s\n",
-           ctx->last_checkpoint_dir[0] != '\0' ? ctx->last_checkpoint_dir : "(belum ada)");
-    printf("Snapshot aktif    : %s\n", ctx->snapshot_active ? "ya" : "tidak");
-    printf("ID snapshot       : %s\n",
-           ctx->snapshot_active && ctx->active_snapshot_id[0] != '\0' ? ctx->active_snapshot_id : "(tidak ada)");
-    puts("");
+    mc_print_kv_text("Root checkpoint", ctx->checkpoint_root);
+    mc_print_kv_text("Checkpoint akhir",
+                     ctx->last_checkpoint_dir[0] != '\0' ? ctx->last_checkpoint_dir : "(belum ada)");
+    mc_print_kv_text("Snapshot aktif", ctx->snapshot_active ? "ya" : "tidak");
+    mc_print_kv_text("ID snapshot",
+                     ctx->snapshot_active && ctx->active_snapshot_id[0] != '\0' ?
+                         ctx->active_snapshot_id :
+                         "(tidak ada)");
 }
 
 /*
@@ -224,7 +222,7 @@ int mc_execute_command(mc_context *ctx, const mc_command *cmd)
         return mc_restore_checkpoint(ctx, cmd->argv[1]);
     case MC_CMD_EXIT:
         ctx->running = false;
-        puts("Keluar dari mini-criu.");
+        mc_log_info("Keluar dari mini-criu.");
         return 0;
     case MC_CMD_INVALID:
         mc_log_error("Perintah tidak dikenali.");
@@ -264,12 +262,13 @@ static int mc_run_repl(mc_context *ctx)
 {
     char line[512];
 
+    mc_print_banner();
     ctx->running = true;
     while (ctx->running) {
         mc_command cmd;
         int parse_status;
 
-        printf("mini-criu> ");
+        mc_print_prompt();
         fflush(stdout);
 
         if (fgets(line, sizeof(line), stdin) == NULL) {

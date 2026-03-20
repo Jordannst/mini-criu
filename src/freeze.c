@@ -230,7 +230,9 @@ int mc_freeze_target(mc_context *ctx)
         return 1;
     }
 
-    printf("Memulai freeze untuk PID %d.\n", ctx->target_pid);
+    mc_print_section("Ringkasan checkpoint");
+    mc_print_kv_int("PID target", ctx->target_pid);
+    mc_log_info("Memulai freeze target.");
 
     /*
      * Attach membuat target masuk ke mode trace. Setelah itu kita wajib menunggu
@@ -247,7 +249,8 @@ int mc_freeze_target(mc_context *ctx)
     }
     attached = true;
 
-    puts("Attach berhasil. Menunggu target berhenti...");
+    mc_log_ok("Attach ptrace berhasil.");
+    mc_log_info("Menunggu target berhenti.");
     if (waitpid(ctx->target_pid, &wait_status, 0) == -1) {
         mc_log_system_error("Gagal menunggu target berhenti");
         goto cleanup;
@@ -260,7 +263,12 @@ int mc_freeze_target(mc_context *ctx)
     stopped = true;
     stop_signal = WSTOPSIG(wait_status);
 
-    printf("Target berhenti dengan sinyal %d.\n", stop_signal);
+    {
+        char message[96];
+
+        snprintf(message, sizeof(message), "Target berhenti dengan sinyal %d.", stop_signal);
+        mc_log_info(message);
+    }
 
     /*
      * Setelah target berhenti, register CPU dapat diambil dengan aman melalui
@@ -311,10 +319,12 @@ int mc_freeze_target(mc_context *ctx)
     ctx->snapshot_active = true;
     attached = false;
 
-    printf("Freeze awal berhasil. Data disimpan di: %s\n", checkpoint_dir);
-    puts("File yang dihasilkan: checkpoint.info dan regs.dump.");
-    puts("Selama sesi CLI ini, target tetap dihentikan agar command 'dump-memory' dapat melanjutkan snapshot yang sama.");
-    puts("Catatan: jika sesi CLI berakhir sebelum dump-memory dijalankan, target akan dilepas kembali otomatis.");
+    mc_log_ok("Freeze awal berhasil.");
+    mc_print_kv_text("Direktori", checkpoint_dir);
+    mc_print_kv_text("File", "checkpoint.info, regs.dump");
+    mc_print_kv_text("Snapshot aktif", "ya");
+    mc_print_kv_text("Perilaku target", "tetap berhenti sampai dump-memory selesai");
+    mc_log_info("Jika sesi CLI berakhir lebih dulu, target akan dilepas kembali otomatis.");
     result = 0;
 
 cleanup:
@@ -331,7 +341,7 @@ cleanup:
             mc_log_system_error("Gagal melepaskan ptrace dari target");
             result = 1;
         } else if (stopped) {
-            puts("Target dilepas kembali dan diizinkan berjalan.");
+            mc_log_info("Target dilepas kembali dan diizinkan berjalan.");
         }
     }
 

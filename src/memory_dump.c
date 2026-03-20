@@ -278,32 +278,42 @@ static int mc_dump_selected_regions(pid_t pid,
 
             bytes_read = pread(mem_fd, buffer, chunk_size, (off_t)current_address);
             if (bytes_read < 0) {
+                char message[256];
+
                 if (errno == EINTR) {
                     continue;
                 }
 
-                fprintf(stderr,
-                        "[galat] Gagal membaca region 0x%llx-0x%llx dari /proc/<pid>/mem: %s\n",
-                        regions[i].start_address,
-                        regions[i].end_address,
-                        strerror(errno));
+                snprintf(message,
+                         sizeof(message),
+                         "Gagal membaca region 0x%llx-0x%llx dari /proc/<pid>/mem",
+                         regions[i].start_address,
+                         regions[i].end_address);
+                mc_log_system_error(message);
                 break;
             }
 
             if (bytes_read == 0) {
-                fprintf(stderr,
-                        "[galat] Pembacaan region 0x%llx-0x%llx berhenti sebelum selesai.\n",
-                        regions[i].start_address,
-                        regions[i].end_address);
+                char message[256];
+
+                snprintf(message,
+                         sizeof(message),
+                         "Pembacaan region 0x%llx-0x%llx berhenti sebelum selesai.",
+                         regions[i].start_address,
+                         regions[i].end_address);
+                mc_log_error(message);
                 break;
             }
 
             if (mc_write_all(dump_fd, buffer, (size_t)bytes_read) != 0) {
-                fprintf(stderr,
-                        "[galat] Gagal menulis byte region 0x%llx-0x%llx ke mem.dump: %s\n",
-                        regions[i].start_address,
-                        regions[i].end_address,
-                        strerror(errno));
+                char message[256];
+
+                snprintf(message,
+                         sizeof(message),
+                         "Gagal menulis byte region 0x%llx-0x%llx ke mem.dump",
+                         regions[i].start_address,
+                         regions[i].end_address);
+                mc_log_system_error(message);
                 break;
             }
 
@@ -524,14 +534,17 @@ int mc_dump_memory(mc_context *ctx)
         return 1;
     }
 
-    printf("Memulai dump memori untuk PID %d.\n", ctx->target_pid);
+    mc_print_section("Ringkasan dump memori");
+    mc_print_kv_int("PID target", ctx->target_pid);
+    mc_log_info("Memulai dump memori mentah.");
 
     /*
      * Pada titik ini target sudah berada dalam keadaan stop karena `freeze`
      * belum melepaskan tracer. Dengan begitu, register dan memori diambil dari
      * satu event snapshot yang lebih konsisten.
      */
-    printf("Melanjutkan snapshot aktif dengan ID %s.\n", ctx->active_snapshot_id);
+    mc_print_kv_text("ID snapshot", ctx->active_snapshot_id);
+    mc_log_info("Melanjutkan snapshot aktif yang sama.");
     snprintf(timestamp, sizeof(timestamp), "%s", ctx->active_snapshot_id);
 
     /*
@@ -617,14 +630,15 @@ int mc_dump_memory(mc_context *ctx)
         goto cleanup;
     }
 
-    printf("Metadata dan dump memori berhasil disimpan di: %s\n", checkpoint_dir);
-    printf("Jumlah region yang diparsing: %zu\n", region_count);
-    printf("Jumlah region terpilih: %zu\n", selected_count);
-    printf("Jumlah region berhasil didump: %zu\n", dumped_regions);
-    printf("Jumlah region terlewati atau gagal: %zu\n", skipped_regions);
-    printf("Total byte mentah yang ditulis: %llu\n", total_dumped_bytes);
-    puts("File yang dihasilkan: mem.meta dan mem.dump.");
-    puts("TODO: restore masih belum diimplementasikan.");
+    mc_log_ok("Metadata dan dump memori berhasil disimpan.");
+    mc_print_kv_text("Direktori", checkpoint_dir);
+    mc_print_kv_size("Region diparsing", region_count);
+    mc_print_kv_size("Region terpilih", selected_count);
+    mc_print_kv_size("Dump berhasil", dumped_regions);
+    mc_print_kv_size("Dump terlewati", skipped_regions);
+    mc_print_kv_u64("Byte mentah", total_dumped_bytes);
+    mc_print_kv_text("File", "mem.meta, mem.dump");
+    mc_log_info("Restore masih bersifat parsial dan eksperimental.");
     result = 0;
 
 cleanup:

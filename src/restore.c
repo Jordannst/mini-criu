@@ -2731,7 +2731,7 @@ static void mc_print_memory_writeback_details(const mc_restore_plan *plan)
         }
 
         if (!has_details) {
-            puts("Detail write-back  :");
+            mc_print_subsection("Detail write-back");
             has_details = true;
         }
 
@@ -2791,7 +2791,7 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
         return;
     }
 
-    puts("Diagnostik resume :");
+    mc_print_subsection("Diagnostik restore");
     printf("  Sinyal stop      : %d (%s)\n",
            plan->target.resume_signal,
            mc_describe_signal_name(plan->target.resume_signal));
@@ -3132,9 +3132,7 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
  */
 static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
 {
-    puts("");
-    puts("ringkasan persiapan restore");
-    puts("---------------------------");
+    mc_print_section("Ringkasan restore");
     printf("Checkpoint dimuat : %s\n", plan->checkpoint_dir);
     printf("Snapshot ID       : %s\n", plan->snapshot_id);
     printf("PID target        : %d\n", plan->pid_target);
@@ -3202,9 +3200,10 @@ static void mc_print_restore_plan_summary(const mc_restore_plan *plan)
 
     mc_print_memory_writeback_details(plan);
 
-    puts("Status restore    : metadata dan target restore awal sudah disiapkan untuk tahap berikutnya.");
-    puts("Catatan           : resume hanya eksperimen terkontrol setelah restore parsial, bukan bukti restore penuh.");
-    puts("");
+    mc_print_kv_text("Status restore",
+                     "metadata dan target restore awal sudah disiapkan untuk tahap berikutnya");
+    mc_print_kv_text("Catatan",
+                     "resume hanya eksperimen terkontrol setelah restore parsial, bukan bukti restore penuh");
 }
 
 int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
@@ -3366,7 +3365,7 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
 
     snprintf(ctx->last_checkpoint_dir, sizeof(ctx->last_checkpoint_dir), "%s", checkpoint_dir);
 
-    puts("Checkpoint berhasil dimuat untuk persiapan restore.");
+    mc_log_ok("Checkpoint berhasil dimuat untuk persiapan restore.");
     mc_print_restore_plan_summary(&plan);
 
     /*

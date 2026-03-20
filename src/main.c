@@ -12,7 +12,6 @@ int main(int argc, char **argv)
     int status;
 
     mc_init_context(&ctx);
-    mc_print_banner();
     status = mc_run_cli(&ctx, argc, argv);
 
     /*

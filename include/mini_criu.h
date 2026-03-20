@@ -75,8 +75,18 @@ int mc_write_text_file(const char *path, const char *contents);
 int mc_join_path(char *buffer, size_t size, const char *left, const char *right);
 void mc_format_timestamp(char *buffer, size_t size);
 void mc_log_info(const char *message);
+void mc_log_ok(const char *message);
+void mc_log_warn(const char *message);
 void mc_log_error(const char *message);
 void mc_log_system_error(const char *message);
+void mc_print_section(const char *title);
+void mc_print_subsection(const char *title);
+void mc_print_kv_text(const char *label, const char *value);
+void mc_print_kv_int(const char *label, long long value);
+void mc_print_kv_size(const char *label, size_t value);
+void mc_print_kv_u64(const char *label, unsigned long long value);
+void mc_print_kv_hex(const char *label, unsigned long long value);
+void mc_print_prompt(void);
 int mc_release_snapshot(mc_context *ctx, bool announce);
 
 int mc_set_target(mc_context *ctx, pid_t pid);

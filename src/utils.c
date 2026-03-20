@@ -11,6 +11,31 @@
 #include <time.h>
 #include <unistd.h>
 
+#define MC_FMT_RESET "\033[0m"
+#define MC_FMT_BOLD_CYAN "\033[1;36m"
+#define MC_FMT_GREEN "\033[32m"
+#define MC_FMT_YELLOW "\033[33m"
+#define MC_FMT_RED "\033[31m"
+#define MC_FMT_DIM "\033[2m"
+
+static bool mc_stream_supports_color(FILE *stream)
+{
+    return isatty(fileno(stream)) != 0;
+}
+
+static void mc_print_level(FILE *stream,
+                           const char *tag,
+                           const char *message,
+                           const char *color_code)
+{
+    if (mc_stream_supports_color(stream)) {
+        fprintf(stream, "%s[%s]%s %s\n", color_code, tag, MC_FMT_RESET, message);
+        return;
+    }
+
+    fprintf(stream, "[%s] %s\n", tag, message);
+}
+
 /*
  * Mengisi konteks awal aplikasi.
  *
@@ -182,7 +207,17 @@ void mc_format_timestamp(char *buffer, size_t size)
  */
 void mc_log_info(const char *message)
 {
-    fprintf(stdout, "[info] %s\n", message);
+    mc_print_level(stdout, "info", message, MC_FMT_BOLD_CYAN);
+}
+
+void mc_log_ok(const char *message)
+{
+    mc_print_level(stdout, "ok", message, MC_FMT_GREEN);
+}
+
+void mc_log_warn(const char *message)
+{
+    mc_print_level(stdout, "warn", message, MC_FMT_YELLOW);
 }
 
 /*
@@ -190,7 +225,7 @@ void mc_log_info(const char *message)
  */
 void mc_log_error(const char *message)
 {
-    fprintf(stderr, "[galat] %s\n", message);
+    mc_print_level(stderr, "err", message, MC_FMT_RED);
 }
 
 /*
@@ -198,9 +233,78 @@ void mc_log_error(const char *message)
  */
 void mc_log_system_error(const char *message)
 {
+    char full_message[512];
     int saved_errno = errno;
 
-    fprintf(stderr, "[galat] %s: %s\n", message, strerror(saved_errno));
+    if (snprintf(full_message,
+                 sizeof(full_message),
+                 "%s: %s",
+                 message,
+                 strerror(saved_errno)) >= (int)sizeof(full_message)) {
+        mc_print_level(stderr, "err", message, MC_FMT_RED);
+        return;
+    }
+
+    mc_print_level(stderr, "err", full_message, MC_FMT_RED);
+}
+
+void mc_print_section(const char *title)
+{
+    putchar('\n');
+    if (mc_stream_supports_color(stdout)) {
+        printf("%s%s%s\n", MC_FMT_BOLD_CYAN, title, MC_FMT_RESET);
+        printf("%s------------------------------%s\n", MC_FMT_DIM, MC_FMT_RESET);
+        return;
+    }
+
+    puts(title);
+    puts("------------------------------");
+}
+
+void mc_print_subsection(const char *title)
+{
+    putchar('\n');
+    if (mc_stream_supports_color(stdout)) {
+        printf("%s%s%s\n", MC_FMT_BOLD_CYAN, title, MC_FMT_RESET);
+        return;
+    }
+
+    puts(title);
+}
+
+void mc_print_kv_text(const char *label, const char *value)
+{
+    printf("  %-18s : %s\n", label, value);
+}
+
+void mc_print_kv_int(const char *label, long long value)
+{
+    printf("  %-18s : %lld\n", label, value);
+}
+
+void mc_print_kv_size(const char *label, size_t value)
+{
+    printf("  %-18s : %zu\n", label, value);
+}
+
+void mc_print_kv_u64(const char *label, unsigned long long value)
+{
+    printf("  %-18s : %llu\n", label, value);
+}
+
+void mc_print_kv_hex(const char *label, unsigned long long value)
+{
+    printf("  %-18s : 0x%llx\n", label, value);
+}
+
+void mc_print_prompt(void)
+{
+    if (mc_stream_supports_color(stdout)) {
+        fputs(MC_FMT_BOLD_CYAN "mini-criu>" MC_FMT_RESET " ", stdout);
+        return;
+    }
+
+    fputs("mini-criu> ", stdout);
 }
 
 /*
@@ -221,11 +325,11 @@ int mc_release_snapshot(mc_context *ctx, bool announce)
             return -1;
         }
 
-        if (announce) {
-            puts("Snapshot aktif dibersihkan, tetapi target sudah tidak tersedia.");
+    if (announce) {
+            mc_log_warn("Snapshot aktif dibersihkan, tetapi target sudah tidak tersedia.");
         }
     } else if (announce) {
-        puts("Target dilepas kembali dan diizinkan berjalan.");
+        mc_log_info("Target dilepas kembali dan diizinkan berjalan.");
     }
 
     ctx->snapshot_active = false;
@@ -253,6 +357,11 @@ int mc_set_target(mc_context *ctx, pid_t pid)
     }
 
     ctx->target_pid = pid;
-    printf("PID target diatur ke %d.\n", pid);
+    {
+        char message[64];
+
+        snprintf(message, sizeof(message), "PID target diatur ke %d.", pid);
+        mc_log_ok(message);
+    }
     return 0;
 }
