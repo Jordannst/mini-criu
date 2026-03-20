@@ -21,6 +21,8 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
+#define MC_STACK_WINDOW_WORDS 9
+
 typedef struct {
     char label[MC_REGION_LABEL_LEN];
     char permissions[MC_REGION_PERMS_LEN];
@@ -124,6 +126,7 @@ typedef struct {
     bool has_stack_snapshot;
     bool has_snapshot_runtime_stack_top;
     bool has_snapshot_checkpoint_stack_top;
+    bool has_stack_window;
     bool elf_info_loaded;
     bool executable_is_pie;
     bool stack_region_found;
@@ -159,6 +162,8 @@ typedef struct {
     bool snapshot_checkpoint_stack_top_points_into_runtime_ready_region;
     bool stack_top_points_into_known_region;
     bool stack_top_points_into_runtime_ready_region;
+    bool stack_window_localized_mismatch;
+    bool stack_window_broader_mismatch;
     unsigned long long rip;
     unsigned long long rsp;
     unsigned long long rbp;
@@ -175,10 +180,18 @@ typedef struct {
     unsigned long long snapshot_runtime_stack_top;
     unsigned long long snapshot_checkpoint_stack_top;
     unsigned long long stack_words[3];
+    unsigned long long stack_window_addresses[MC_STACK_WINDOW_WORDS];
+    unsigned long long stack_window_runtime_values[MC_STACK_WINDOW_WORDS];
+    unsigned long long stack_window_snapshot_values[MC_STACK_WINDOW_WORDS];
     int signal_code;
     int elf_type;
     size_t stack_words_read;
+    size_t stack_window_compared_slots;
+    size_t stack_window_match_count;
+    size_t stack_window_diff_count;
+    size_t stack_window_changed_to_null_count;
     long long rsp_delta_from_checkpoint;
+    long long stack_window_offsets[MC_STACK_WINDOW_WORDS];
     int checkpoint_rip_region_index;
     int checkpoint_rsp_region_index;
     int checkpoint_rbp_region_index;
@@ -189,7 +202,15 @@ typedef struct {
     int snapshot_runtime_stack_top_region_index;
     int snapshot_checkpoint_stack_top_region_index;
     int stack_top_region_index;
+    int stack_window_runtime_target_regions[MC_STACK_WINDOW_WORDS];
+    int stack_window_snapshot_target_regions[MC_STACK_WINDOW_WORDS];
+    int stack_window_mismatch_before_top;
+    int stack_window_mismatch_after_top;
     char likely_cause[256];
+    char stack_window_summary[160];
+    bool stack_window_runtime_valid[MC_STACK_WINDOW_WORDS];
+    bool stack_window_snapshot_valid[MC_STACK_WINDOW_WORDS];
+    bool stack_window_values_match[MC_STACK_WINDOW_WORDS];
 } mc_restore_diagnostics;
 
 typedef struct {
@@ -664,6 +685,19 @@ static bool mc_region_is_runtime_ready(const mc_restore_plan *plan, int region_i
     return entry->write_succeeded;
 }
 
+static const char *mc_describe_pointer_target(const mc_restore_plan *plan, int region_index)
+{
+    if (region_index < 0 || (size_t)region_index >= plan->region_count) {
+        return "luar checkpoint";
+    }
+
+    if (plan->regions[region_index].label[0] != '\0') {
+        return plan->regions[region_index].label;
+    }
+
+    return "(tanpa label)";
+}
+
 /*
  * Nama sinyal dipakai agar laporan crash lebih mudah dipahami daripada hanya
  * angka mentah dari kernel.
@@ -832,6 +866,118 @@ static bool mc_read_checkpoint_word_from_dump(const mc_restore_plan *plan,
     return bytes_read == (ssize_t)sizeof(*value_out);
 }
 
+/*
+ * Jendela stack yang sempit cukup untuk melihat apakah mismatch hanya terjadi
+ * di slot return teratas, atau justru beberapa slot di sekitar RSP juga sudah
+ * menyimpang. Ini membantu membedakan mismatch lokal dari pergeseran stack
+ * yang lebih luas tanpa berubah menjadi debugger penuh.
+ */
+static void mc_collect_stack_window_trace(mc_restore_plan *plan,
+                                          const mc_restore_region *rsp_region)
+{
+    static const long long offsets[MC_STACK_WINDOW_WORDS] = {
+        -0x20, -0x18, -0x10, -0x8, 0x0, 0x8, 0x10, 0x18, 0x20
+    };
+    bool top_slot_diff = false;
+
+    for (size_t i = 0; i < MC_STACK_WINDOW_WORDS; ++i) {
+        long long signed_address = (long long)plan->diagnostics.rsp + offsets[i];
+        unsigned long long address = 0;
+
+        plan->diagnostics.stack_window_offsets[i] = offsets[i];
+        plan->diagnostics.stack_window_runtime_target_regions[i] = -1;
+        plan->diagnostics.stack_window_snapshot_target_regions[i] = -1;
+
+        if (signed_address < 0) {
+            continue;
+        }
+
+        address = (unsigned long long)signed_address;
+        plan->diagnostics.stack_window_addresses[i] = address;
+
+        if (address < rsp_region->start_address ||
+            address + sizeof(unsigned long long) > rsp_region->end_address) {
+            continue;
+        }
+
+        if (mc_read_target_word(plan->target.pid, address,
+                                &plan->diagnostics.stack_window_runtime_values[i])) {
+            plan->diagnostics.stack_window_runtime_valid[i] = true;
+            plan->diagnostics.stack_window_runtime_target_regions[i] =
+                mc_find_region_index_for_address(plan,
+                                                 plan->diagnostics.stack_window_runtime_values[i]);
+        }
+
+        if (mc_read_checkpoint_word_from_dump(plan, address,
+                                              &plan->diagnostics.stack_window_snapshot_values[i])) {
+            plan->diagnostics.stack_window_snapshot_valid[i] = true;
+            plan->diagnostics.stack_window_snapshot_target_regions[i] =
+                mc_find_region_index_for_address(plan,
+                                                 plan->diagnostics.stack_window_snapshot_values[i]);
+        }
+
+        if (plan->diagnostics.stack_window_runtime_valid[i] &&
+            plan->diagnostics.stack_window_snapshot_valid[i]) {
+            plan->diagnostics.has_stack_window = true;
+            ++plan->diagnostics.stack_window_compared_slots;
+            plan->diagnostics.stack_window_values_match[i] =
+                (plan->diagnostics.stack_window_runtime_values[i] ==
+                 plan->diagnostics.stack_window_snapshot_values[i]);
+
+            if (plan->diagnostics.stack_window_values_match[i]) {
+                ++plan->diagnostics.stack_window_match_count;
+            } else {
+                ++plan->diagnostics.stack_window_diff_count;
+                if (offsets[i] < 0) {
+                    ++plan->diagnostics.stack_window_mismatch_before_top;
+                } else if (offsets[i] > 0) {
+                    ++plan->diagnostics.stack_window_mismatch_after_top;
+                } else {
+                    top_slot_diff = true;
+                }
+
+                if (plan->diagnostics.stack_window_runtime_values[i] == 0 &&
+                    plan->diagnostics.stack_window_snapshot_values[i] != 0) {
+                    ++plan->diagnostics.stack_window_changed_to_null_count;
+                }
+            }
+        }
+    }
+
+    if (!plan->diagnostics.has_stack_window) {
+        return;
+    }
+
+    if (top_slot_diff &&
+        plan->diagnostics.stack_window_diff_count <= 2 &&
+        plan->diagnostics.stack_window_mismatch_before_top == 0 &&
+        plan->diagnostics.stack_window_mismatch_after_top <= 1) {
+        plan->diagnostics.stack_window_localized_mismatch = true;
+        snprintf(plan->diagnostics.stack_window_summary,
+                 sizeof(plan->diagnostics.stack_window_summary),
+                 "%s",
+                 "mismatch tampak terlokalisasi di sekitar top-of-stack");
+    } else if (plan->diagnostics.stack_window_diff_count >= 3 ||
+               (plan->diagnostics.stack_window_mismatch_before_top > 0 &&
+                plan->diagnostics.stack_window_mismatch_after_top > 0)) {
+        plan->diagnostics.stack_window_broader_mismatch = true;
+        snprintf(plan->diagnostics.stack_window_summary,
+                 sizeof(plan->diagnostics.stack_window_summary),
+                 "%s",
+                 "beberapa slot di sekitar RSP juga sudah menyimpang dari snapshot");
+    } else if (plan->diagnostics.stack_window_diff_count == 0) {
+        snprintf(plan->diagnostics.stack_window_summary,
+                 sizeof(plan->diagnostics.stack_window_summary),
+                 "%s",
+                 "slot yang dibandingkan masih sama dengan snapshot");
+    } else {
+        snprintf(plan->diagnostics.stack_window_summary,
+                 sizeof(plan->diagnostics.stack_window_summary),
+                 "%s",
+                 "ada mismatch terbatas, tetapi polanya belum sepenuhnya lokal maupun luas");
+    }
+}
+
 static void mc_collect_stack_transfer_clues(mc_restore_plan *plan)
 {
     const mc_restore_region *rsp_region = NULL;
@@ -850,6 +996,8 @@ static void mc_collect_stack_transfer_clues(mc_restore_plan *plan)
         mc_region_is_runtime_ready(plan, plan->diagnostics.rsp_region_index)) {
         plan->diagnostics.rsp_points_into_restored_stack = true;
     }
+
+    mc_collect_stack_window_trace(plan, rsp_region);
 
     for (size_t i = 0; i < 3; ++i) {
         address = plan->diagnostics.rsp + (i * sizeof(unsigned long long));
@@ -1166,7 +1314,21 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
         if (plan->diagnostics.has_fault_address &&
             plan->diagnostics.fault_matches_rip &&
             plan->diagnostics.fault_address == 0) {
-            if (plan->diagnostics.has_stack_snapshot &&
+            if (plan->diagnostics.has_stack_window &&
+                plan->diagnostics.stack_window_broader_mismatch &&
+                plan->diagnostics.stack_window_changed_to_null_count > 0) {
+                snprintf(plan->diagnostics.likely_cause,
+                         sizeof(plan->diagnostics.likely_cause),
+                         "%s",
+                         "Jendela stack menunjukkan beberapa slot di sekitar RSP ikut berbeda dari snapshot, dan sebagian berubah menjadi nol. Ini lebih mirip mismatch stack/control-flow yang lebih luas.");
+            } else if (plan->diagnostics.has_stack_window &&
+                       plan->diagnostics.stack_window_localized_mismatch &&
+                       plan->diagnostics.stack_window_changed_to_null_count > 0) {
+                snprintf(plan->diagnostics.likely_cause,
+                         sizeof(plan->diagnostics.likely_cause),
+                         "%s",
+                         "Jendela stack menunjukkan mismatch yang terlokalisasi di sekitar top-of-stack, dengan slot return yang berubah menjadi nol. Ini paling mirip return chain yang rusak.");
+            } else if (plan->diagnostics.has_stack_snapshot &&
                 plan->diagnostics.has_snapshot_runtime_stack_top &&
                 plan->diagnostics.snapshot_runtime_stack_top_matches_runtime &&
                 plan->diagnostics.snapshot_runtime_stack_top_is_null &&
@@ -2758,6 +2920,71 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
                        mc_describe_region_restore_state(plan,
                                                         plan->diagnostics.snapshot_checkpoint_stack_top_region_index));
             }
+        }
+
+        if (plan->diagnostics.has_stack_window) {
+            puts("  Jendela stack    : RSP-0x20 s.d. RSP+0x20");
+            for (size_t i = 0; i < MC_STACK_WINDOW_WORDS; ++i) {
+                char offset_label[16];
+
+                if (!plan->diagnostics.stack_window_runtime_valid[i] &&
+                    !plan->diagnostics.stack_window_snapshot_valid[i]) {
+                    continue;
+                }
+
+                if (plan->diagnostics.stack_window_offsets[i] < 0) {
+                    snprintf(offset_label,
+                             sizeof(offset_label),
+                             "-0x%llx",
+                             (unsigned long long)(-plan->diagnostics.stack_window_offsets[i]));
+                } else {
+                    snprintf(offset_label,
+                             sizeof(offset_label),
+                             "+0x%llx",
+                             (unsigned long long)plan->diagnostics.stack_window_offsets[i]);
+                }
+
+                printf("  slot %-8s : rt=%s",
+                       offset_label,
+                       plan->diagnostics.stack_window_runtime_valid[i] ? "" : "(tidak terbaca)");
+                if (plan->diagnostics.stack_window_runtime_valid[i]) {
+                    printf("0x%llx", plan->diagnostics.stack_window_runtime_values[i]);
+                }
+
+                printf(" | snap=%s",
+                       plan->diagnostics.stack_window_snapshot_valid[i] ? "" : "(tidak ada)");
+                if (plan->diagnostics.stack_window_snapshot_valid[i]) {
+                    printf("0x%llx", plan->diagnostics.stack_window_snapshot_values[i]);
+                }
+
+                if (plan->diagnostics.stack_window_runtime_valid[i] &&
+                    plan->diagnostics.stack_window_snapshot_valid[i]) {
+                    printf(" | %s",
+                           plan->diagnostics.stack_window_values_match[i] ? "cocok" : "beda");
+                }
+
+                if (plan->diagnostics.stack_window_runtime_valid[i]) {
+                    printf(" | rt->%s",
+                           mc_describe_pointer_target(plan,
+                                                      plan->diagnostics.stack_window_runtime_target_regions[i]));
+                }
+
+                if (plan->diagnostics.stack_window_snapshot_valid[i]) {
+                    printf(" | snap->%s",
+                           mc_describe_pointer_target(plan,
+                                                      plan->diagnostics.stack_window_snapshot_target_regions[i]));
+                }
+
+                puts("");
+            }
+
+            printf("  Ringkas stack    : %zu cocok, %zu beda\n",
+                   plan->diagnostics.stack_window_match_count,
+                   plan->diagnostics.stack_window_diff_count);
+            printf("  Pola stack       : %s\n",
+                   plan->diagnostics.stack_window_summary[0] != '\0' ?
+                       plan->diagnostics.stack_window_summary :
+                       "jendela stack belum memberi pola yang jelas");
         }
     } else {
         puts("  Register runtime : belum berhasil dibaca setelah target berhenti lagi");
