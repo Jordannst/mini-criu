@@ -90,6 +90,9 @@ typedef struct {
     bool regs_apply_verified;
     bool runtime_base_step_attempted;
     bool runtime_base_step_verified;
+    bool pie_rebase_attempted;
+    bool pie_rebase_applied;
+    bool pie_rebase_verified;
     bool resume_attempted;
     bool resume_completed;
     bool resume_running_briefly;
@@ -103,6 +106,12 @@ typedef struct {
     unsigned long long applied_rbp;
     unsigned long long applied_fs_base;
     unsigned long long applied_gs_base;
+    unsigned long long pie_rebase_source_rip;
+    unsigned long long pie_rebase_target_rip;
+    unsigned long long pie_rebase_verified_rip;
+    unsigned long long pie_rebase_result_rip;
+    int pie_rebase_result_signal;
+    char pie_rebase_note[160];
     char resume_note[128];
 } mc_restore_target;
 
@@ -711,6 +720,39 @@ static bool mc_compute_image_base(const mc_restore_region *region, unsigned long
 }
 
 /*
+ * Sebelum resume kedua dicoba, status observasi sebelumnya dibersihkan agar
+ * hasil percobaan rebase bisa dibaca sebagai eksperimen yang terpisah.
+ */
+static void mc_reset_resume_observation(mc_restore_plan *plan)
+{
+    plan->target.resume_attempted = false;
+    plan->target.resume_completed = false;
+    plan->target.resume_running_briefly = false;
+    plan->target.resume_stopped_again = false;
+    plan->target.resume_exited = false;
+    plan->target.resume_signaled = false;
+    plan->target.resume_signal = 0;
+    plan->target.resume_exit_code = 0;
+    plan->target.resume_note[0] = '\0';
+    memset(&plan->diagnostics, 0, sizeof(plan->diagnostics));
+}
+
+static bool mc_should_attempt_pie_rebase(const mc_restore_plan *plan)
+{
+    return plan->target.created &&
+           plan->target.traced &&
+           plan->target.stopped &&
+           plan->target.resume_stopped_again &&
+           plan->target.resume_signal == SIGSEGV &&
+           plan->diagnostics.has_runtime_regs &&
+           plan->diagnostics.rip_low_address &&
+           plan->diagnostics.elf_info_loaded &&
+           plan->diagnostics.executable_is_pie &&
+           plan->diagnostics.checkpoint_image_base != 0 &&
+           plan->diagnostics.runtime_rip_inside_exec_file_window;
+}
+
+/*
  * Header ELF dari file executable asli cukup untuk diagnosis awal: kita bisa
  * melihat apakah binary tampak sebagai PIE (`ET_DYN`) dan berapa entry offset
  * yang dipakai loader saat memulai eksekusi.
@@ -907,7 +949,14 @@ static void mc_collect_resume_diagnostics(mc_restore_plan *plan)
     }
 
     if (plan->target.resume_signal == SIGSEGV) {
-        if (plan->diagnostics.has_applied_regs &&
+        if (plan->diagnostics.has_fault_address &&
+            plan->diagnostics.fault_matches_rip &&
+            plan->diagnostics.fault_address == 0) {
+            snprintf(plan->diagnostics.likely_cause,
+                     sizeof(plan->diagnostics.likely_cause),
+                     "%s",
+                     "Sesudah resume, alur kontrol jatuh ke alamat nol. Ini mengarah pada pointer/target kontrol yang tidak valid meskipun basis image sudah dicoba diselaraskan.");
+        } else if (plan->diagnostics.has_applied_regs &&
             plan->diagnostics.applied_rip_matches_checkpoint &&
             plan->diagnostics.elf_info_loaded &&
             plan->diagnostics.executable_is_pie &&
@@ -1724,6 +1773,9 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
     plan->target.regs_apply_verified = false;
     plan->target.runtime_base_step_attempted = false;
     plan->target.runtime_base_step_verified = false;
+    plan->target.pie_rebase_attempted = false;
+    plan->target.pie_rebase_applied = false;
+    plan->target.pie_rebase_verified = false;
     plan->target.resume_attempted = false;
     plan->target.resume_completed = false;
     plan->target.resume_running_briefly = false;
@@ -1737,6 +1789,12 @@ static int mc_cleanup_restore_target(mc_restore_plan *plan, bool announce)
     plan->target.applied_rbp = 0;
     plan->target.applied_fs_base = 0;
     plan->target.applied_gs_base = 0;
+    plan->target.pie_rebase_source_rip = 0;
+    plan->target.pie_rebase_target_rip = 0;
+    plan->target.pie_rebase_verified_rip = 0;
+    plan->target.pie_rebase_result_rip = 0;
+    plan->target.pie_rebase_result_signal = 0;
+    plan->target.pie_rebase_note[0] = '\0';
     plan->target.resume_note[0] = '\0';
     return 0;
 }
@@ -1953,6 +2011,133 @@ static int mc_run_controlled_resume_experiment(mc_restore_plan *plan)
     snprintf(plan->target.resume_note,
              sizeof(plan->target.resume_note),
              "target sempat berjalan singkat lalu dihentikan kembali");
+    return 0;
+}
+
+/*
+ * Jika resume pertama berhenti pada RIP rendah yang terlihat seperti offset
+ * image PIE, tool mencoba satu koreksi kecil: menambahkan kembali basis image
+ * checkpoint ke RIP rendah tersebut lalu melakukan resume singkat sekali lagi.
+ *
+ * Ini bukan emulasi loader. Langkah ini hanya eksperimen terarah untuk
+ * menjawab apakah gejala low-RIP murni berasal dari basis image yang hilang.
+ */
+static int mc_attempt_pie_base_realignment(mc_restore_plan *plan)
+{
+    struct user_regs_struct regs;
+    struct user_regs_struct verify_regs;
+    int corrected_region_index = -1;
+
+    if (!mc_should_attempt_pie_rebase(plan)) {
+        return 0;
+    }
+
+    plan->target.pie_rebase_attempted = true;
+    plan->target.pie_rebase_source_rip = plan->diagnostics.rip;
+    plan->target.pie_rebase_target_rip = plan->diagnostics.checkpoint_image_base +
+                                         plan->diagnostics.rip;
+
+    corrected_region_index =
+        mc_find_region_index_for_address(plan, plan->target.pie_rebase_target_rip);
+    if (corrected_region_index < 0) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "RIP hasil rebase jatuh di luar region checkpoint, jadi percobaan dibatalkan");
+        return 0;
+    }
+
+    if (ptrace(PTRACE_GETREGS, plan->target.pid, NULL, &regs) == -1) {
+        mc_log_system_error("Gagal membaca register sebelum percobaan rebase RIP");
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "register target tidak bisa dibaca sebelum rebase RIP");
+        return 0;
+    }
+
+    regs.rip = plan->target.pie_rebase_target_rip;
+    if (ptrace(PTRACE_SETREGS, plan->target.pid, NULL, &regs) == -1) {
+        mc_log_system_error("Gagal menerapkan rebase RIP berbasis image checkpoint");
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "rebase RIP ke basis image gagal diterapkan");
+        return 0;
+    }
+
+    plan->target.pie_rebase_applied = true;
+
+    if (ptrace(PTRACE_GETREGS, plan->target.pid, NULL, &verify_regs) == 0) {
+        plan->target.pie_rebase_verified_rip = verify_regs.rip;
+        plan->target.pie_rebase_verified =
+            (verify_regs.rip == plan->target.pie_rebase_target_rip);
+    }
+
+    if (!plan->target.pie_rebase_verified) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "RIP hasil rebase belum terlihat stabil saat diverifikasi");
+        return 0;
+    }
+
+    mc_reset_resume_observation(plan);
+
+    if (mc_run_controlled_resume_experiment(plan) != 0) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "resume ulang setelah rebase RIP gagal dijalankan");
+        return -1;
+    }
+
+    plan->target.pie_rebase_result_signal = plan->target.resume_signal;
+    if (plan->diagnostics.has_runtime_regs) {
+        plan->target.pie_rebase_result_rip = plan->diagnostics.rip;
+    }
+
+    if (plan->diagnostics.has_runtime_regs &&
+        plan->diagnostics.rip == 0) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "sesudah rebase basis image, perilaku berubah menjadi RIP nol yang mengarah ke target kontrol null");
+    } else if (plan->diagnostics.has_runtime_regs &&
+        plan->diagnostics.rip_low_address &&
+        plan->diagnostics.rip == plan->target.pie_rebase_source_rip) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "RIP rendah yang sama muncul lagi sesudah rebase basis image");
+    } else if (plan->diagnostics.has_runtime_regs &&
+               plan->diagnostics.rip_low_address) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "RIP masih rendah, tetapi nilainya berubah setelah rebase basis image");
+    } else if (plan->target.resume_stopped_again) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "rebase basis image mengubah perilaku, tetapi target masih berhenti lagi");
+    } else if (plan->target.resume_exited) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "sesudah rebase basis image, target keluar dari eksekusi");
+    } else if (plan->target.resume_signaled) {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "sesudah rebase basis image, target terkena sinyal fatal yang berbeda");
+    } else {
+        snprintf(plan->target.pie_rebase_note,
+                 sizeof(plan->target.pie_rebase_note),
+                 "%s",
+                 "rebase basis image dicoba, tetapi hasilnya belum memberi pola yang jelas");
+    }
+
     return 0;
 }
 
@@ -2246,6 +2431,23 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
                    "belum cocok dengan checkpoint");
     }
 
+    if (plan->target.pie_rebase_attempted) {
+        printf("  Rebase PIE       : 0x%llx -> 0x%llx\n",
+               plan->target.pie_rebase_source_rip,
+               plan->target.pie_rebase_target_rip);
+        printf("  Status rebase    : %s\n",
+               plan->target.pie_rebase_verified ?
+                   "RIP hasil rebase berhasil dipasang" :
+                   "RIP hasil rebase belum terpasang stabil");
+        if (plan->target.pie_rebase_verified) {
+            printf("  RIP verifikasi   : 0x%llx\n", plan->target.pie_rebase_verified_rip);
+        }
+        printf("  Hasil rebase     : %s\n",
+               plan->target.pie_rebase_note[0] != '\0' ?
+                   plan->target.pie_rebase_note :
+                   "belum ada catatan hasil");
+    }
+
     if (plan->regs.loaded) {
         printf("  RIP checkpoint   : 0x%llx\n", plan->regs.rip);
         if (plan->diagnostics.checkpoint_rip_region_index >= 0) {
@@ -2303,7 +2505,9 @@ static void mc_print_resume_diagnostics(const mc_restore_plan *plan)
 
     if (plan->diagnostics.has_runtime_regs &&
         plan->diagnostics.checkpoint_image_base != 0) {
-        if (plan->diagnostics.runtime_rip_matches_elf_entry) {
+        if (plan->diagnostics.rip == 0) {
+            puts("  Interpretasi RIP : RIP runtime menjadi nol, mengarah ke target kontrol null");
+        } else if (plan->diagnostics.runtime_rip_matches_elf_entry) {
             puts("  Interpretasi RIP : RIP runtime sama persis dengan entry ELF");
         } else if (plan->diagnostics.runtime_rip_near_elf_entry) {
             puts("  Interpretasi RIP : RIP runtime sangat dekat dengan entry ELF");
@@ -2554,6 +2758,19 @@ int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir)
      * diamati dan dilaporkan; bukan bukti bahwa restore sudah selesai.
      */
     if (mc_run_controlled_resume_experiment(&plan) != 0) {
+        mc_cleanup_restore_target(&plan, false);
+        free(plan.mapping_entries);
+        free(plan.regions);
+        return 1;
+    }
+
+    /*
+     * Jika resume pertama jatuh ke offset rendah yang mirip image PIE,
+     * lakukan satu percobaan kecil dengan menambahkan kembali basis image
+     * checkpoint ke RIP rendah tersebut. Hasilnya hanya dipakai sebagai
+     * eksperimen, bukan sebagai restore final.
+     */
+    if (mc_attempt_pie_base_realignment(&plan) != 0) {
         mc_cleanup_restore_target(&plan, false);
         free(plan.mapping_entries);
         free(plan.regions);
