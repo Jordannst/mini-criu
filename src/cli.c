@@ -17,14 +17,14 @@ static mc_command_kind mc_lookup_command(const char *name)
     if (strcmp(name, "clear") == 0 || strcmp(name, "/clear") == 0) {
         return MC_CMD_CLEAR;
     }
-    if (strcmp(name, "set-target") == 0) {
-        return MC_CMD_SET_TARGET;
-    }
     if (strcmp(name, "freeze") == 0) {
         return MC_CMD_FREEZE;
     }
     if (strcmp(name, "dump-memory") == 0) {
         return MC_CMD_DUMP_MEMORY;
+    }
+    if (strcmp(name, "list") == 0) {
+        return MC_CMD_LIST;
     }
     if (strcmp(name, "restore") == 0) {
         return MC_CMD_RESTORE;
@@ -74,23 +74,23 @@ static int mc_parse_tokens(int argc, char **argv, mc_command *cmd)
     case MC_CMD_HELP:
     case MC_CMD_STATUS:
     case MC_CMD_CLEAR:
-    case MC_CMD_FREEZE:
     case MC_CMD_DUMP_MEMORY:
+    case MC_CMD_LIST:
     case MC_CMD_EXIT:
         if (argc != 1) {
             cmd->error = "perintah ini tidak menerima argumen tambahan";
             return -1;
         }
         break;
-    case MC_CMD_SET_TARGET:
+    case MC_CMD_FREEZE:
         if (argc != 2) {
-            cmd->error = "penggunaan: set-target <pid>";
+            cmd->error = "penggunaan: freeze <pid>";
             return -1;
         }
         break;
     case MC_CMD_RESTORE:
         if (argc != 2) {
-            cmd->error = "penggunaan: restore <checkpoint_dir>";
+            cmd->error = "penggunaan: restore <flag_checkpoint>";
             return -1;
         }
         break;
@@ -108,9 +108,8 @@ static int mc_parse_tokens(int argc, char **argv, mc_command *cmd)
 void mc_print_banner(void)
 {
     mc_print_section("mini-criu");
-    puts("  prototipe eksperimental checkpoint/restore untuk proses Linux");
-    puts("  by Jordan & Grantly");
-    puts("  Ketik 'help' untuk melihat perintah yang tersedia.");
+    puts("  CLI checkpoint/restore eksperimental untuk proses Linux");
+    puts("  Alur cepat: freeze <pid> -> dump-memory -> list -> restore <flag>");
 }
 
 /*
@@ -119,14 +118,14 @@ void mc_print_banner(void)
 void mc_print_help(void)
 {
     mc_print_section("Perintah tersedia");
-    printf("  %-24s %s\n", "help", "Menampilkan pesan bantuan ini");
-    printf("  %-24s %s\n", "status", "Menampilkan status CLI saat ini");
-    printf("  %-24s %s\n", "clear, /clear", "Membersihkan tampilan terminal");
-    printf("  %-24s %s\n", "set-target <pid>", "Memilih proses untuk diperiksa/checkpoint");
-    printf("  %-24s %s\n", "freeze", "Memulai snapshot, menyimpan register, dan menahan target tetap stop");
-    printf("  %-24s %s\n", "dump-memory", "Menyelesaikan snapshot aktif dengan mem.meta dan mem.dump");
-    printf("  %-24s %s\n", "restore <checkpoint_dir>", "Memuat checkpoint, mencoba register, write-back memori, dan resume eksperimen");
-    printf("  %-24s %s\n", "exit", "Keluar dari shell interaktif");
+    printf("  %-20s %s\n", "help", "Lihat daftar perintah");
+    printf("  %-20s %s\n", "status", "Lihat status sesi saat ini");
+    printf("  %-20s %s\n", "clear, /clear", "Bersihkan terminal");
+    printf("  %-20s %s\n", "freeze <pid>", "Freeze proses dan mulai snapshot");
+    printf("  %-20s %s\n", "dump-memory", "Simpan mem.meta dan mem.dump");
+    printf("  %-20s %s\n", "list", "Lihat semua checkpoint dengan flag singkat");
+    printf("  %-20s %s\n", "restore <flag>", "Restore checkpoint berdasarkan flag");
+    printf("  %-20s %s\n", "exit", "Keluar dari CLI");
 }
 
 /*
@@ -146,12 +145,10 @@ void mc_print_status(const mc_context *ctx)
     }
 
     mc_print_kv_text("Root checkpoint", ctx->checkpoint_root);
-    mc_print_kv_text("Checkpoint akhir",
-                     ctx->last_checkpoint_dir[0] != '\0' ? ctx->last_checkpoint_dir : "(belum ada)");
     mc_print_kv_text("Snapshot aktif", ctx->snapshot_active ? "ya" : "tidak");
-    mc_print_kv_text("ID snapshot",
-                     ctx->snapshot_active && ctx->active_snapshot_id[0] != '\0' ?
-                         ctx->active_snapshot_id :
+    mc_print_kv_text("Flag snapshot",
+                     ctx->snapshot_active && ctx->active_checkpoint_flag[0] != '\0' ?
+                         ctx->active_checkpoint_flag :
                          "(tidak ada)");
 }
 
@@ -195,6 +192,7 @@ int mc_parse_command(char *line, mc_command *cmd)
 int mc_execute_command(mc_context *ctx, const mc_command *cmd)
 {
     pid_t pid = -1;
+    char checkpoint_path[PATH_MAX];
 
     switch (cmd->kind) {
     case MC_CMD_HELP:
@@ -208,18 +206,29 @@ int mc_execute_command(mc_context *ctx, const mc_command *cmd)
         fputs("\033[2J\033[H", stdout);
         fflush(stdout);
         return 0;
-    case MC_CMD_SET_TARGET:
+    case MC_CMD_FREEZE:
         if (!mc_parse_pid(cmd->argv[1], &pid)) {
             mc_log_error("PID tidak valid. Gunakan bilangan bulat positif.");
             return 1;
         }
-        return mc_set_target(ctx, pid);
-    case MC_CMD_FREEZE:
+        if (!mc_process_exists(pid)) {
+            mc_log_error("PID target tidak berjalan atau tidak terlihat dari lingkungan ini.");
+            return 1;
+        }
+        ctx->target_pid = pid;
         return mc_freeze_target(ctx);
     case MC_CMD_DUMP_MEMORY:
         return mc_dump_memory(ctx);
+    case MC_CMD_LIST:
+        return mc_list_checkpoints(ctx);
     case MC_CMD_RESTORE:
-        return mc_restore_checkpoint(ctx, cmd->argv[1]);
+        if (mc_resolve_checkpoint_reference(ctx,
+                                            cmd->argv[1],
+                                            checkpoint_path,
+                                            sizeof(checkpoint_path)) != 0) {
+            return 1;
+        }
+        return mc_restore_checkpoint(ctx, checkpoint_path);
     case MC_CMD_EXIT:
         ctx->running = false;
         mc_log_info("Keluar dari mini-criu.");

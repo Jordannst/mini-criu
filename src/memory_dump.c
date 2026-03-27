@@ -359,6 +359,7 @@ static int mc_dump_selected_regions(pid_t pid,
  */
 static int mc_write_memory_metadata_file(const char *path,
                                          pid_t pid,
+                                         const char *checkpoint_flag,
                                          const char *snapshot_id,
                                          const char *timestamp,
                                          const mc_memory_region *regions,
@@ -377,6 +378,7 @@ static int mc_write_memory_metadata_file(const char *path,
 
     if (fprintf(file,
                 "jenis_dump=raw_memori\n"
+                "checkpoint_flag=%s\n"
                 "snapshot_id=%s\n"
                 "pid_target=%d\n"
                 "dibuat_pada=%s\n"
@@ -388,6 +390,7 @@ static int mc_write_memory_metadata_file(const char *path,
                 "jumlah_region_dump_berhasil=%zu\n"
                 "jumlah_region_dump_terlewati=%zu\n"
                 "jumlah_byte_dump=%llu\n\n",
+                checkpoint_flag,
                 snapshot_id,
                 pid,
                 timestamp,
@@ -448,6 +451,7 @@ static int mc_write_memory_metadata_file(const char *path,
  */
 static int mc_append_memory_summary(const char *path,
                                     pid_t pid,
+                                    const char *checkpoint_flag,
                                     const char *snapshot_id,
                                     const char *timestamp,
                                     size_t total_regions,
@@ -466,6 +470,8 @@ static int mc_append_memory_summary(const char *path,
     if (fprintf(file,
                 "\n"
                 "jenis_dump_memori=raw_memori\n"
+                "checkpoint_flag=%s\n"
+                "checkpoint_code=%s\n"
                 "snapshot_id_memori=%s\n"
                 "pid_target_memori=%d\n"
                 "dibuat_pada_memori=%s\n"
@@ -478,7 +484,9 @@ static int mc_append_memory_summary(const char *path,
                 "jumlah_region_dump_terlewati=%zu\n"
                 "jumlah_byte_dump=%llu\n"
                 "konsistensi_snapshot=register_dan_memori_diambil_dari_stop_yang_sama\n"
-                "catatan_memori=Target dilepas kembali setelah dump-memory selesai. Restore masih belum diimplementasikan.\n",
+                "catatan_memori=Target dilepas kembali setelah dump-memory selesai. Restore parsial dapat dicoba dengan command restore.\n",
+                checkpoint_flag,
+                snapshot_id,
                 snapshot_id,
                 pid,
                 timestamp,
@@ -504,6 +512,7 @@ int mc_dump_memory(mc_context *ctx)
 {
     char message[160];
     char timestamp[32];
+    char snapshot_id[MC_SNAPSHOT_ID_LEN];
     char checkpoint_dir[PATH_MAX];
     char metadata_path[PATH_MAX];
     char mem_meta_path[PATH_MAX];
@@ -526,7 +535,7 @@ int mc_dump_memory(mc_context *ctx)
     }
 
     if (ctx->target_pid <= 0) {
-        mc_log_error("Belum ada target yang dipilih. Gunakan 'set-target <pid>' terlebih dahulu.");
+        mc_log_error("Belum ada target yang dipilih. Jalankan 'freeze <pid>' terlebih dahulu.");
         return 1;
     }
 
@@ -544,9 +553,13 @@ int mc_dump_memory(mc_context *ctx)
      * belum melepaskan tracer. Dengan begitu, register dan memori diambil dari
      * satu event snapshot yang lebih konsisten.
      */
-    mc_print_kv_text("ID snapshot", ctx->active_snapshot_id);
+    mc_print_kv_text("Flag checkpoint",
+                     ctx->active_checkpoint_flag[0] != '\0' ?
+                         ctx->active_checkpoint_flag :
+                         "(tidak ada)");
     mc_log_info("Melanjutkan snapshot aktif yang sama.");
-    snprintf(timestamp, sizeof(timestamp), "%s", ctx->active_snapshot_id);
+    snprintf(snapshot_id, sizeof(snapshot_id), "%s", ctx->active_snapshot_id);
+    mc_format_timestamp(timestamp, sizeof(timestamp));
 
     /*
      * Setelah target berhenti, daftar region dimuat lebih dulu agar kita tahu
@@ -626,7 +639,8 @@ int mc_dump_memory(mc_context *ctx)
     mc_log_info("Menulis metadata hasil dump memori.");
     if (mc_write_memory_metadata_file(mem_meta_path,
                                       ctx->target_pid,
-                                      ctx->active_snapshot_id,
+                                      ctx->active_checkpoint_flag,
+                                      snapshot_id,
                                       timestamp,
                                       regions,
                                       region_count,
@@ -639,7 +653,8 @@ int mc_dump_memory(mc_context *ctx)
 
     if (mc_append_memory_summary(metadata_path,
                                  ctx->target_pid,
-                                 ctx->active_snapshot_id,
+                                 ctx->active_checkpoint_flag,
+                                 snapshot_id,
                                  timestamp,
                                  region_count,
                                  selected_count,

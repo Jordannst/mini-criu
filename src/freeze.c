@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -17,44 +18,64 @@
  */
 static int mc_prepare_freeze_checkpoint_dir(mc_context *ctx,
                                             const char *timestamp,
+                                            char *checkpoint_code,
+                                            size_t checkpoint_code_size,
                                             char *checkpoint_dir,
                                             size_t size)
 {
     char directory_name[128];
-    int written;
 
     if (mc_ensure_directory(ctx->checkpoint_root) != 0) {
         mc_log_error("Gagal membuat direktori root checkpoint.");
         return -1;
     }
 
-    written = snprintf(directory_name,
-                       sizeof(directory_name),
-                       "checkpoint-pid-%d-%s",
-                       ctx->target_pid,
-                       timestamp);
-    if (written < 0 || (size_t)written >= sizeof(directory_name)) {
-        mc_log_error("Nama direktori checkpoint terlalu panjang.");
-        return -1;
+    for (unsigned int sequence = 1; sequence <= 999; ++sequence) {
+        int written = snprintf(checkpoint_code,
+                               checkpoint_code_size,
+                               "cp-%d-%s-%03u",
+                               ctx->target_pid,
+                               timestamp,
+                               sequence);
+        if (written < 0 || (size_t)written >= checkpoint_code_size) {
+            mc_log_error("Kode checkpoint terlalu panjang.");
+            return -1;
+        }
+
+        written = snprintf(directory_name,
+                           sizeof(directory_name),
+                           "checkpoint-%s",
+                           checkpoint_code);
+        if (written < 0 || (size_t)written >= sizeof(directory_name)) {
+            mc_log_error("Nama direktori checkpoint terlalu panjang.");
+            return -1;
+        }
+
+        if (mc_join_path(checkpoint_dir, size, ctx->checkpoint_root, directory_name) != 0) {
+            mc_log_error("Path checkpoint terlalu panjang.");
+            return -1;
+        }
+
+        if (mkdir(checkpoint_dir, 0755) == 0) {
+            written = snprintf(ctx->last_checkpoint_dir,
+                               sizeof(ctx->last_checkpoint_dir),
+                               "%s",
+                               checkpoint_dir);
+            if (written < 0 || (size_t)written >= sizeof(ctx->last_checkpoint_dir)) {
+                mc_log_error("Path checkpoint terlalu panjang untuk disimpan di konteks.");
+                return -1;
+            }
+            return 0;
+        }
+
+        if (errno != EEXIST) {
+            mc_log_system_error("Gagal membuat direktori checkpoint");
+            return -1;
+        }
     }
 
-    if (mc_join_path(checkpoint_dir, size, ctx->checkpoint_root, directory_name) != 0) {
-        mc_log_error("Path checkpoint terlalu panjang.");
-        return -1;
-    }
-
-    if (mc_ensure_directory(checkpoint_dir) != 0) {
-        mc_log_error("Gagal membuat direktori checkpoint.");
-        return -1;
-    }
-
-    written = snprintf(ctx->last_checkpoint_dir, sizeof(ctx->last_checkpoint_dir), "%s", checkpoint_dir);
-    if (written < 0 || (size_t)written >= sizeof(ctx->last_checkpoint_dir)) {
-        mc_log_error("Path checkpoint terlalu panjang untuk disimpan di konteks.");
-        return -1;
-    }
-
-    return 0;
+    mc_log_error("Gagal membuat kode checkpoint unik untuk snapshot ini.");
+    return -1;
 }
 
 /*
@@ -65,6 +86,8 @@ static int mc_prepare_freeze_checkpoint_dir(mc_context *ctx,
  */
 static int mc_write_register_dump(const char *path,
                                   pid_t pid,
+                                  const char *checkpoint_flag,
+                                  const char *checkpoint_code,
                                   const char *timestamp,
                                   const struct user_regs_struct *regs)
 {
@@ -77,6 +100,8 @@ static int mc_write_register_dump(const char *path,
 
     if (fprintf(file,
                 "jenis_dump=register_cpu_x86_64\n"
+                "checkpoint_flag=%s\n"
+                "checkpoint_code=%s\n"
                 "pid_target=%d\n"
                 "dibuat_pada=%s\n"
                 "r15=0x%llx\n"
@@ -106,6 +131,8 @@ static int mc_write_register_dump(const char *path,
                 "es=0x%llx\n"
                 "fs=0x%llx\n"
                 "gs=0x%llx\n",
+                checkpoint_flag,
+                checkpoint_code,
                 pid,
                 timestamp,
                 (unsigned long long)regs->r15,
@@ -155,6 +182,8 @@ static int mc_write_register_dump(const char *path,
  * file mana yang berisi dump register.
  */
 static int mc_write_freeze_metadata(const char *path,
+                                    const char *checkpoint_flag,
+                                    const char *checkpoint_code,
                                     pid_t pid,
                                     const char *snapshot_id,
                                     const char *timestamp,
@@ -167,6 +196,8 @@ static int mc_write_freeze_metadata(const char *path,
     written = snprintf(metadata,
                        sizeof(metadata),
                        "jenis_checkpoint=freeze\n"
+                       "checkpoint_flag=%s\n"
+                       "checkpoint_code=%s\n"
                        "snapshot_id=%s\n"
                        "pid_target=%d\n"
                        "dibuat_pada=%s\n"
@@ -177,8 +208,10 @@ static int mc_write_freeze_metadata(const char *path,
                        "rip_awal=0x%llx\n"
                        "rsp_awal=0x%llx\n"
                        "dump_memori=menunggu_command_dump-memory\n"
-                       "restore=belum_diimplementasikan\n"
+                       "restore=tersedia_secara_parsial_via_command_restore\n"
                        "catatan=Target tetap dihentikan setelah freeze agar dump register dan dump memori bisa berasal dari snapshot yang sama selama sesi CLI ini.\n",
+                       checkpoint_flag,
+                       checkpoint_code,
                        snapshot_id,
                        pid,
                        timestamp,
@@ -202,6 +235,8 @@ int mc_freeze_target(mc_context *ctx)
 {
     struct user_regs_struct regs;
     char timestamp[32];
+    char checkpoint_flag[MC_CHECKPOINT_FLAG_LEN];
+    char checkpoint_code[MC_CHECKPOINT_CODE_LEN];
     char checkpoint_dir[PATH_MAX];
     char regs_path[PATH_MAX];
     char metadata_path[PATH_MAX];
@@ -221,7 +256,7 @@ int mc_freeze_target(mc_context *ctx)
     }
 
     if (ctx->target_pid <= 0) {
-        mc_log_error("Belum ada target yang dipilih. Gunakan 'set-target <pid>' terlebih dahulu.");
+        mc_log_error("Belum ada target yang dipilih. Gunakan 'freeze <pid>' atau atur target lebih dulu.");
         return 1;
     }
 
@@ -285,6 +320,10 @@ int mc_freeze_target(mc_context *ctx)
 
     mc_format_timestamp(timestamp, sizeof(timestamp));
 
+    if (mc_allocate_checkpoint_flag(ctx, checkpoint_flag, sizeof(checkpoint_flag)) != 0) {
+        goto cleanup;
+    }
+
     /*
      * Setelah register tersedia, direktori checkpoint disiapkan dan dua file
      * awal ditulis:
@@ -292,7 +331,12 @@ int mc_freeze_target(mc_context *ctx)
      * - `checkpoint.info` untuk ringkasan checkpoint
      */
     mc_log_info("Menyiapkan direktori dan artefak checkpoint.");
-    if (mc_prepare_freeze_checkpoint_dir(ctx, timestamp, checkpoint_dir, sizeof(checkpoint_dir)) != 0) {
+    if (mc_prepare_freeze_checkpoint_dir(ctx,
+                                         timestamp,
+                                         checkpoint_code,
+                                         sizeof(checkpoint_code),
+                                         checkpoint_dir,
+                                         sizeof(checkpoint_dir)) != 0) {
         goto cleanup;
     }
 
@@ -306,11 +350,23 @@ int mc_freeze_target(mc_context *ctx)
         goto cleanup;
     }
 
-    if (mc_write_register_dump(regs_path, ctx->target_pid, timestamp, &regs) != 0) {
+    if (mc_write_register_dump(regs_path,
+                               ctx->target_pid,
+                               checkpoint_flag,
+                               checkpoint_code,
+                               timestamp,
+                               &regs) != 0) {
         goto cleanup;
     }
 
-    if (mc_write_freeze_metadata(metadata_path, ctx->target_pid, timestamp, timestamp, stop_signal, &regs) != 0) {
+    if (mc_write_freeze_metadata(metadata_path,
+                                 checkpoint_flag,
+                                 checkpoint_code,
+                                 ctx->target_pid,
+                                 checkpoint_code,
+                                 timestamp,
+                                 stop_signal,
+                                 &regs) != 0) {
         goto cleanup;
     }
     mc_log_ok("Artefak awal checkpoint berhasil disimpan.");
@@ -320,12 +376,16 @@ int mc_freeze_target(mc_context *ctx)
      * ditulis. Mulai titik ini target sengaja tetap dalam keadaan stop sampai
      * `dump-memory` selesai atau sesi CLI berakhir.
      */
-    snprintf(ctx->active_snapshot_id, sizeof(ctx->active_snapshot_id), "%s", timestamp);
+    snprintf(ctx->active_snapshot_id, sizeof(ctx->active_snapshot_id), "%s", checkpoint_code);
+    snprintf(ctx->active_checkpoint_flag,
+             sizeof(ctx->active_checkpoint_flag),
+             "%s",
+             checkpoint_flag);
     ctx->snapshot_active = true;
     attached = false;
 
     mc_log_ok("Freeze awal berhasil.");
-    mc_print_kv_text("Direktori", checkpoint_dir);
+    mc_print_kv_text("Flag checkpoint", checkpoint_flag);
     mc_print_kv_text("File", "checkpoint.info, regs.dump");
     mc_print_kv_text("Snapshot aktif", "ya");
     mc_print_kv_text("Perilaku target", "tetap berhenti sampai dump-memory selesai");

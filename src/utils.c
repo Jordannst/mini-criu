@@ -1,5 +1,6 @@
 #include "mini_criu.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -51,6 +52,7 @@ void mc_init_context(mc_context *ctx)
     snprintf(ctx->checkpoint_root, sizeof(ctx->checkpoint_root), "%s", MC_DEFAULT_CHECKPOINT_ROOT);
     ctx->last_checkpoint_dir[0] = '\0';
     ctx->active_snapshot_id[0] = '\0';
+    ctx->active_checkpoint_flag[0] = '\0';
 }
 
 /*
@@ -320,6 +322,432 @@ void mc_print_prompt(void)
     fflush(stdout);
 }
 
+typedef struct {
+    char checkpoint_flag[MC_CHECKPOINT_FLAG_LEN];
+    char checkpoint_code[MC_CHECKPOINT_CODE_LEN];
+    char checkpoint_dir[PATH_MAX];
+    char created_at[64];
+    char status_snapshot[64];
+    pid_t pid_target;
+    bool has_checkpoint_flag;
+} mc_checkpoint_catalog_entry;
+
+static const char *mc_basename_from_path(const char *path)
+{
+    const char *last_separator = strrchr(path, '/');
+
+    if (last_separator == NULL) {
+        return path;
+    }
+
+    return last_separator + 1;
+}
+
+static int mc_copy_text_field(char *destination,
+                              size_t destination_size,
+                              const char *value,
+                              const char *error_message)
+{
+    int written = snprintf(destination, destination_size, "%s", value);
+
+    if (written < 0 || (size_t)written >= destination_size) {
+        mc_log_error(error_message);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int mc_read_checkpoint_catalog_entry(const char *checkpoint_dir,
+                                            mc_checkpoint_catalog_entry *entry)
+{
+    char checkpoint_info_path[PATH_MAX];
+    FILE *file = NULL;
+    char line[512];
+    bool has_pid = false;
+    bool has_code = false;
+
+    memset(entry, 0, sizeof(*entry));
+    entry->pid_target = -1;
+
+    if (mc_join_path(checkpoint_info_path,
+                     sizeof(checkpoint_info_path),
+                     checkpoint_dir,
+                     "checkpoint.info") != 0) {
+        mc_log_error("Path checkpoint.info terlalu panjang.");
+        return -1;
+    }
+
+    file = fopen(checkpoint_info_path, "r");
+    if (file == NULL) {
+        return -1;
+    }
+
+    if (mc_copy_text_field(entry->checkpoint_dir,
+                           sizeof(entry->checkpoint_dir),
+                           checkpoint_dir,
+                           "Path direktori checkpoint terlalu panjang.") != 0) {
+        fclose(file);
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char *equal_sign = NULL;
+        char *key = NULL;
+        char *value = NULL;
+
+        mc_trim_newline(line);
+        if (line[0] == '\0' || line[0] == '[') {
+            continue;
+        }
+
+        equal_sign = strchr(line, '=');
+        if (equal_sign == NULL) {
+            continue;
+        }
+
+        *equal_sign = '\0';
+        key = mc_trim_whitespace(line);
+        value = mc_trim_whitespace(equal_sign + 1);
+
+        if (strcmp(key, "checkpoint_flag") == 0) {
+            if (mc_copy_text_field(entry->checkpoint_flag,
+                                   sizeof(entry->checkpoint_flag),
+                                   value,
+                                   "Flag checkpoint terlalu panjang.") != 0) {
+                fclose(file);
+                return -1;
+            }
+            entry->has_checkpoint_flag = true;
+        } else if (strcmp(key, "checkpoint_code") == 0) {
+            if (mc_copy_text_field(entry->checkpoint_code,
+                                   sizeof(entry->checkpoint_code),
+                                   value,
+                                   "Kode checkpoint terlalu panjang.") != 0) {
+                fclose(file);
+                return -1;
+            }
+            has_code = true;
+        } else if (strcmp(key, "pid_target") == 0) {
+            if (!mc_parse_pid(value, &entry->pid_target)) {
+                fclose(file);
+                mc_log_error("Nilai pid_target pada checkpoint.info tidak valid.");
+                return -1;
+            }
+            has_pid = true;
+        } else if (strcmp(key, "dibuat_pada") == 0) {
+            if (mc_copy_text_field(entry->created_at,
+                                   sizeof(entry->created_at),
+                                   value,
+                                   "Nilai dibuat_pada terlalu panjang.") != 0) {
+                fclose(file);
+                return -1;
+            }
+        } else if (strcmp(key, "status_snapshot") == 0) {
+            if (mc_copy_text_field(entry->status_snapshot,
+                                   sizeof(entry->status_snapshot),
+                                   value,
+                                   "Nilai status_snapshot terlalu panjang.") != 0) {
+                fclose(file);
+                return -1;
+            }
+        }
+    }
+
+    if (fclose(file) != 0) {
+        mc_log_system_error("Gagal menutup checkpoint.info");
+        return -1;
+    }
+
+    if (!has_code) {
+        const char *base_name = mc_basename_from_path(checkpoint_dir);
+
+        if (strncmp(base_name, "checkpoint-", 11) == 0) {
+            base_name += 11;
+        }
+
+        if (mc_copy_text_field(entry->checkpoint_code,
+                               sizeof(entry->checkpoint_code),
+                               base_name,
+                               "Kode checkpoint fallback terlalu panjang.") != 0) {
+            return -1;
+        }
+    }
+
+    if (!has_pid) {
+        mc_log_error("checkpoint.info belum memuat pid_target yang dibutuhkan.");
+        return -1;
+    }
+
+    if (entry->created_at[0] == '\0') {
+        if (mc_copy_text_field(entry->created_at,
+                               sizeof(entry->created_at),
+                               "(tidak diketahui)",
+                               "Nilai fallback dibuat_pada terlalu panjang.") != 0) {
+            return -1;
+        }
+    }
+
+    if (entry->status_snapshot[0] == '\0') {
+        if (mc_copy_text_field(entry->status_snapshot,
+                               sizeof(entry->status_snapshot),
+                               "(tidak diketahui)",
+                               "Nilai fallback status_snapshot terlalu panjang.") != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int mc_append_checkpoint_catalog_entry(mc_checkpoint_catalog_entry **entries,
+                                              size_t *count,
+                                              size_t *capacity,
+                                              const mc_checkpoint_catalog_entry *entry)
+{
+    mc_checkpoint_catalog_entry *new_entries = NULL;
+
+    if (*count == *capacity) {
+        size_t new_capacity = *capacity == 0 ? 8 : (*capacity * 2);
+
+        new_entries = realloc(*entries, new_capacity * sizeof(*new_entries));
+        if (new_entries == NULL) {
+            mc_log_error("Gagal mengalokasikan memori untuk daftar checkpoint.");
+            return -1;
+        }
+
+        *entries = new_entries;
+        *capacity = new_capacity;
+    }
+
+    (*entries)[(*count)++] = *entry;
+    return 0;
+}
+
+static bool mc_parse_checkpoint_flag_number(const char *flag, unsigned int *number_out)
+{
+    char *end = NULL;
+    unsigned long value = 0;
+
+    if (flag == NULL || flag[0] != 'F' || flag[1] == '\0') {
+        return false;
+    }
+
+    errno = 0;
+    value = strtoul(flag + 1, &end, 10);
+    if (errno != 0 || end == (flag + 1) || *end != '\0' || value == 0 || value > 999999u) {
+        return false;
+    }
+
+    *number_out = (unsigned int)value;
+    return true;
+}
+
+static bool mc_is_checkpoint_flag_in_use(const mc_checkpoint_catalog_entry *entries,
+                                         size_t count,
+                                         const char *checkpoint_flag)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (entries[i].checkpoint_flag[0] == '\0') {
+            continue;
+        }
+
+        if (strcmp(entries[i].checkpoint_flag, checkpoint_flag) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int mc_append_checkpoint_flag_to_info(const char *checkpoint_dir, const char *checkpoint_flag)
+{
+    char checkpoint_info_path[PATH_MAX];
+    FILE *file = NULL;
+
+    if (mc_join_path(checkpoint_info_path,
+                     sizeof(checkpoint_info_path),
+                     checkpoint_dir,
+                     "checkpoint.info") != 0) {
+        mc_log_error("Path checkpoint.info terlalu panjang.");
+        return -1;
+    }
+
+    file = fopen(checkpoint_info_path, "a");
+    if (file == NULL) {
+        mc_log_system_error("Gagal membuka checkpoint.info untuk menulis flag");
+        return -1;
+    }
+
+    if (fprintf(file, "checkpoint_flag=%s\n", checkpoint_flag) < 0) {
+        fclose(file);
+        mc_log_system_error("Gagal menulis flag checkpoint");
+        return -1;
+    }
+
+    if (fclose(file) != 0) {
+        mc_log_system_error("Gagal menutup checkpoint.info");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int mc_assign_missing_checkpoint_flags(mc_checkpoint_catalog_entry *entries, size_t count)
+{
+    unsigned int next_number = 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        unsigned int current_number = 0;
+
+        if (!entries[i].has_checkpoint_flag) {
+            continue;
+        }
+
+        if (!mc_parse_checkpoint_flag_number(entries[i].checkpoint_flag, &current_number)) {
+            continue;
+        }
+
+        if (current_number >= next_number) {
+            next_number = current_number + 1;
+        }
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        char checkpoint_flag[MC_CHECKPOINT_FLAG_LEN];
+
+        if (entries[i].has_checkpoint_flag) {
+            continue;
+        }
+
+        do {
+            int written = snprintf(checkpoint_flag,
+                                   sizeof(checkpoint_flag),
+                                   "F%04u",
+                                   next_number++);
+            if (written < 0 || (size_t)written >= sizeof(checkpoint_flag)) {
+                mc_log_error("Flag checkpoint terlalu panjang.");
+                return -1;
+            }
+        } while (mc_is_checkpoint_flag_in_use(entries, count, checkpoint_flag));
+
+        if (mc_append_checkpoint_flag_to_info(entries[i].checkpoint_dir, checkpoint_flag) != 0) {
+            return -1;
+        }
+
+        if (mc_copy_text_field(entries[i].checkpoint_flag,
+                               sizeof(entries[i].checkpoint_flag),
+                               checkpoint_flag,
+                               "Flag checkpoint terlalu panjang.") != 0) {
+            return -1;
+        }
+
+        entries[i].has_checkpoint_flag = true;
+    }
+
+    return 0;
+}
+
+static int mc_collect_checkpoint_catalog(const mc_context *ctx,
+                                         mc_checkpoint_catalog_entry **entries_out,
+                                         size_t *count_out)
+{
+    DIR *directory = NULL;
+    struct dirent *entry = NULL;
+    mc_checkpoint_catalog_entry *entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+
+    *entries_out = NULL;
+    *count_out = 0;
+
+    if (!mc_directory_exists(ctx->checkpoint_root)) {
+        return 0;
+    }
+
+    directory = opendir(ctx->checkpoint_root);
+    if (directory == NULL) {
+        mc_log_system_error("Gagal membuka direktori root checkpoint");
+        return -1;
+    }
+
+    while ((entry = readdir(directory)) != NULL) {
+        char checkpoint_dir[PATH_MAX];
+        char checkpoint_info_path[PATH_MAX];
+        struct stat st;
+        mc_checkpoint_catalog_entry catalog_entry;
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        if (mc_join_path(checkpoint_dir, sizeof(checkpoint_dir), ctx->checkpoint_root, entry->d_name) != 0) {
+            free(entries);
+            closedir(directory);
+            mc_log_error("Path direktori checkpoint terlalu panjang.");
+            return -1;
+        }
+
+        if (stat(checkpoint_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+
+        if (mc_join_path(checkpoint_info_path,
+                         sizeof(checkpoint_info_path),
+                         checkpoint_dir,
+                         "checkpoint.info") != 0) {
+            free(entries);
+            closedir(directory);
+            mc_log_error("Path checkpoint.info terlalu panjang.");
+            return -1;
+        }
+
+        if (stat(checkpoint_info_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+
+        if (mc_read_checkpoint_catalog_entry(checkpoint_dir, &catalog_entry) != 0) {
+            free(entries);
+            closedir(directory);
+            return -1;
+        }
+
+        if (mc_append_checkpoint_catalog_entry(&entries, &count, &capacity, &catalog_entry) != 0) {
+            free(entries);
+            closedir(directory);
+            return -1;
+        }
+    }
+
+    if (closedir(directory) != 0) {
+        free(entries);
+        mc_log_system_error("Gagal menutup direktori root checkpoint");
+        return -1;
+    }
+
+    if (mc_assign_missing_checkpoint_flags(entries, count) != 0) {
+        free(entries);
+        return -1;
+    }
+
+    *entries_out = entries;
+    *count_out = count;
+    return 0;
+}
+
+static int mc_compare_checkpoint_entries(const void *left, const void *right)
+{
+    const mc_checkpoint_catalog_entry *left_entry = left;
+    const mc_checkpoint_catalog_entry *right_entry = right;
+    int created_compare = strcmp(right_entry->created_at, left_entry->created_at);
+
+    if (created_compare != 0) {
+        return created_compare;
+    }
+
+    return strcmp(right_entry->checkpoint_code, left_entry->checkpoint_code);
+}
+
 /*
  * Melepaskan target yang masih ditahan oleh snapshot aktif.
  *
@@ -347,34 +775,133 @@ int mc_release_snapshot(mc_context *ctx, bool announce)
 
     ctx->snapshot_active = false;
     ctx->active_snapshot_id[0] = '\0';
+    ctx->active_checkpoint_flag[0] = '\0';
     return 0;
 }
 
-/*
- * Menyimpan PID target ke konteks setelah memastikan prosesnya ada.
- */
-int mc_set_target(mc_context *ctx, pid_t pid)
+int mc_list_checkpoints(const mc_context *ctx)
 {
-    /*
-     * Mengganti target saat snapshot masih aktif akan membuat alur checkpoint
-     * membingungkan karena proses lama masih ditahan dalam keadaan stop.
-     */
-    if (ctx->snapshot_active) {
-        mc_log_error("Masih ada snapshot aktif. Jalankan 'dump-memory' untuk menyelesaikannya atau keluar dari CLI untuk membatalkannya.");
+    mc_checkpoint_catalog_entry *entries = NULL;
+    size_t count = 0;
+
+    if (mc_collect_checkpoint_catalog(ctx, &entries, &count) != 0) {
         return 1;
     }
 
-    if (!mc_process_exists(pid)) {
-        mc_log_error("PID target tidak berjalan atau tidak terlihat dari lingkungan ini.");
-        return 1;
+    mc_print_section("Daftar checkpoint");
+
+    if (count == 0) {
+        free(entries);
+        mc_log_info("Belum ada checkpoint yang tersimpan.");
+        return 0;
     }
 
-    ctx->target_pid = pid;
-    {
-        char message[64];
+    qsort(entries, count, sizeof(*entries), mc_compare_checkpoint_entries);
 
-        snprintf(message, sizeof(message), "PID target diatur ke %d.", pid);
-        mc_log_ok(message);
+    printf("  %-8s %-8s %-26s %s\n",
+           "Flag",
+           "PID",
+           "Dibuat",
+           "Status");
+    for (size_t i = 0; i < count; ++i) {
+        printf("  %-8s %-8d %-26s %s\n",
+               entries[i].checkpoint_flag,
+               entries[i].pid_target,
+               entries[i].created_at,
+               entries[i].status_snapshot);
     }
+    fflush(stdout);
+
+    free(entries);
     return 0;
+}
+
+int mc_allocate_checkpoint_flag(const mc_context *ctx,
+                                char *checkpoint_flag,
+                                size_t checkpoint_flag_size)
+{
+    mc_checkpoint_catalog_entry *entries = NULL;
+    size_t count = 0;
+    unsigned int next_number = 1;
+
+    if (mc_collect_checkpoint_catalog(ctx, &entries, &count) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        unsigned int current_number = 0;
+
+        if (!mc_parse_checkpoint_flag_number(entries[i].checkpoint_flag, &current_number)) {
+            continue;
+        }
+
+        if (current_number >= next_number) {
+            next_number = current_number + 1;
+        }
+    }
+
+    while (1) {
+        int written = snprintf(checkpoint_flag, checkpoint_flag_size, "F%04u", next_number++);
+
+        if (written < 0 || (size_t)written >= checkpoint_flag_size) {
+            free(entries);
+            mc_log_error("Flag checkpoint terlalu panjang.");
+            return -1;
+        }
+
+        if (!mc_is_checkpoint_flag_in_use(entries, count, checkpoint_flag)) {
+            break;
+        }
+    }
+
+    free(entries);
+    return 0;
+}
+
+int mc_resolve_checkpoint_reference(const mc_context *ctx,
+                                    const char *reference,
+                                    char *resolved_path,
+                                    size_t resolved_path_size)
+{
+    mc_checkpoint_catalog_entry *entries = NULL;
+    size_t count = 0;
+
+    if (mc_directory_exists(reference)) {
+        if (mc_copy_text_field(resolved_path,
+                               resolved_path_size,
+                               reference,
+                               "Path checkpoint terlalu panjang.") != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (mc_collect_checkpoint_catalog(ctx, &entries, &count) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const char *base_name = mc_basename_from_path(entries[i].checkpoint_dir);
+
+        if (strcmp(entries[i].checkpoint_flag, reference) != 0 &&
+            strcmp(entries[i].checkpoint_code, reference) != 0 &&
+            strcmp(base_name, reference) != 0) {
+            continue;
+        }
+
+        if (mc_copy_text_field(resolved_path,
+                               resolved_path_size,
+                               entries[i].checkpoint_dir,
+                               "Path checkpoint terlalu panjang.") != 0) {
+            free(entries);
+            return -1;
+        }
+
+        free(entries);
+        return 0;
+    }
+
+    free(entries);
+    mc_log_error("Flag checkpoint tidak ditemukan.");
+    return -1;
 }

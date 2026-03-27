@@ -15,16 +15,18 @@
 #define MC_REGION_PERMS_LEN 5
 #define MC_REGION_LABEL_LEN 256
 #define MC_REGION_DUMP_STATUS_LEN 32
-#define MC_SNAPSHOT_ID_LEN 32
+#define MC_SNAPSHOT_ID_LEN 64
+#define MC_CHECKPOINT_CODE_LEN 64
+#define MC_CHECKPOINT_FLAG_LEN 16
 
 typedef enum {
     MC_CMD_INVALID = -1,
     MC_CMD_HELP = 0,
     MC_CMD_STATUS,
     MC_CMD_CLEAR,
-    MC_CMD_SET_TARGET,
     MC_CMD_FREEZE,
     MC_CMD_DUMP_MEMORY,
+    MC_CMD_LIST,
     MC_CMD_RESTORE,
     MC_CMD_EXIT
 } mc_command_kind;
@@ -41,6 +43,7 @@ typedef struct {
     char checkpoint_root[PATH_MAX];
     char last_checkpoint_dir[PATH_MAX];
     char active_snapshot_id[MC_SNAPSHOT_ID_LEN];
+    char active_checkpoint_flag[MC_CHECKPOINT_FLAG_LEN];
     bool running;
     bool snapshot_active;
 } mc_context;
@@ -89,9 +92,16 @@ void mc_print_kv_hex(const char *label, unsigned long long value);
 void mc_print_prompt(void);
 int mc_release_snapshot(mc_context *ctx, bool announce);
 
-int mc_set_target(mc_context *ctx, pid_t pid);
 int mc_freeze_target(mc_context *ctx);
 int mc_dump_memory(mc_context *ctx);
+int mc_list_checkpoints(const mc_context *ctx);
+int mc_allocate_checkpoint_flag(const mc_context *ctx,
+                                char *checkpoint_flag,
+                                size_t checkpoint_flag_size);
+int mc_resolve_checkpoint_reference(const mc_context *ctx,
+                                    const char *reference,
+                                    char *resolved_path,
+                                    size_t resolved_path_size);
 int mc_restore_checkpoint(mc_context *ctx, const char *checkpoint_dir);
 
 #endif

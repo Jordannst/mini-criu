@@ -4,7 +4,7 @@
 
 Fokus utama `mini-criu` adalah:
 
-- memilih proses target
+- memilih proses target langsung dari command freeze
 - membuat checkpoint proses
 - menyimpan metadata dan isi memori penting
 - memuat checkpoint kembali
@@ -20,16 +20,18 @@ Proyek ini belum ditujukan sebagai pengganti CRIU dan belum mencapai restore pro
 
 `mini-criu` saat ini dapat:
 
-- memilih target dengan `set-target <pid>`
+- melakukan freeze langsung dengan `freeze <pid>`
 - melakukan freeze proses dan mengambil snapshot register
 - membuat artefak checkpoint:
   - `checkpoint.info`
   - `regs.dump`
   - `mem.meta`
   - `mem.dump`
+- memberi setiap checkpoint flag singkat seperti `F0001`
 - menjaga konsistensi snapshot antara `freeze` dan `dump-memory`
 - membaca metadata region memori dari `/proc/<pid>/maps`
 - membaca isi memori mentah dari `/proc/<pid>/mem`
+- menampilkan daftar checkpoint yang tersimpan lewat `list`
 - memuat dan memvalidasi direktori checkpoint
 - membangun rencana restore dari metadata checkpoint
 - membuat proses target restore sementara
@@ -40,7 +42,7 @@ Proyek ini belum ditujukan sebagai pengganti CRIU dan belum mencapai restore pro
 
 ## Alur Restore Saat Ini
 
-Perintah `restore <checkpoint_dir>` saat ini bekerja sebagai alur restore parsial:
+Perintah `restore <flag_checkpoint>` saat ini bekerja sebagai alur restore parsial:
 
 1. memvalidasi direktori checkpoint dan file yang dibutuhkan
 2. memuat register dan metadata memori
@@ -105,17 +107,18 @@ Untuk menjalankan satu command tanpa masuk shell interaktif:
 ```bash
 ./build/mini-criu help
 ./build/mini-criu status
-./build/mini-criu restore checkpoints/contoh
+./build/mini-criu list
+./build/mini-criu restore F0001
 ```
 
 ## Perintah CLI
 
 - `help`
 - `status`
-- `set-target <pid>`
-- `freeze`
+- `freeze <pid>`
 - `dump-memory`
-- `restore <checkpoint_dir>`
+- `list`
+- `restore <flag_checkpoint>`
 - `clear`
 - `/clear`
 - `exit`
@@ -137,24 +140,23 @@ Jalankan CLI:
 Contoh alur checkpoint:
 
 ```text
-mini-criu> set-target 12345
-mini-criu> status
-mini-criu> freeze
+mini-criu> freeze 12345
 mini-criu> dump-memory
+mini-criu> list
 mini-criu> exit
 ```
 
 Contoh restore:
 
 ```bash
-./build/mini-criu restore checkpoints/checkpoint-pid-12345-YYYYMMDD-HHMMSS
+./build/mini-criu restore F0001
 ```
 
 ## Isi Direktori Checkpoint
 
 Direktori checkpoint umumnya berisi:
 
-- `checkpoint.info` untuk metadata umum checkpoint
+- `checkpoint.info` untuk metadata umum checkpoint, flag singkat, dan kode internal
 - `regs.dump` untuk snapshot register
 - `mem.meta` untuk metadata region memori dan layout dump
 - `mem.dump` untuk data memori mentah dari region yang dipilih
