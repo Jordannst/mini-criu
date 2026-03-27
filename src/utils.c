@@ -735,6 +735,121 @@ static int mc_collect_checkpoint_catalog(const mc_context *ctx,
     return 0;
 }
 
+static int mc_find_checkpoint_catalog_entry(const mc_context *ctx,
+                                            const char *reference,
+                                            mc_checkpoint_catalog_entry *entry_out)
+{
+    mc_checkpoint_catalog_entry *entries = NULL;
+    size_t count = 0;
+
+    if (mc_collect_checkpoint_catalog(ctx, &entries, &count) != 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        const char *base_name = mc_basename_from_path(entries[i].checkpoint_dir);
+
+        if (strcmp(entries[i].checkpoint_flag, reference) != 0 &&
+            strcmp(entries[i].checkpoint_code, reference) != 0 &&
+            strcmp(base_name, reference) != 0 &&
+            strcmp(entries[i].checkpoint_dir, reference) != 0) {
+            continue;
+        }
+
+        *entry_out = entries[i];
+        free(entries);
+        return 0;
+    }
+
+    free(entries);
+    mc_log_error("Flag checkpoint tidak ditemukan.");
+    return -1;
+}
+
+static int mc_read_process_state(pid_t pid, char *state_out)
+{
+    char status_path[PATH_MAX];
+    FILE *file = NULL;
+    char line[256];
+
+    if (snprintf(status_path, sizeof(status_path), "/proc/%d/status", pid) >= (int)sizeof(status_path)) {
+        mc_log_error("Path status proses terlalu panjang.");
+        return -1;
+    }
+
+    file = fopen(status_path, "r");
+    if (file == NULL) {
+        mc_log_system_error("Gagal membuka /proc/<pid>/status");
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (strncmp(line, "State:", 6) != 0) {
+            continue;
+        }
+
+        for (char *cursor = line + 6; *cursor != '\0'; ++cursor) {
+            if (*cursor == ' ' || *cursor == '\t') {
+                continue;
+            }
+
+            *state_out = *cursor;
+            fclose(file);
+            return 0;
+        }
+    }
+
+    fclose(file);
+    mc_log_error("State proses tidak ditemukan di /proc/<pid>/status.");
+    return -1;
+}
+
+static int mc_append_resume_summary(const char *checkpoint_dir, const char *checkpoint_flag, pid_t pid)
+{
+    char checkpoint_info_path[PATH_MAX];
+    char timestamp[32];
+    FILE *file = NULL;
+
+    if (mc_join_path(checkpoint_info_path,
+                     sizeof(checkpoint_info_path),
+                     checkpoint_dir,
+                     "checkpoint.info") != 0) {
+        mc_log_error("Path checkpoint.info terlalu panjang.");
+        return -1;
+    }
+
+    mc_format_timestamp(timestamp, sizeof(timestamp));
+
+    file = fopen(checkpoint_info_path, "a");
+    if (file == NULL) {
+        mc_log_system_error("Gagal membuka checkpoint.info untuk update resume");
+        return -1;
+    }
+
+    if (fprintf(file,
+                "\n"
+                "checkpoint_flag=%s\n"
+                "resume_manual=ya\n"
+                "resume_manual_pada=%s\n"
+                "resume_manual_pid=%d\n"
+                "status_snapshot=dilanjutkan_kembali\n"
+                "catatan_resume=Proses asli dilanjutkan kembali dengan command resume.\n",
+                checkpoint_flag,
+                timestamp,
+                pid) < 0) {
+        fclose(file);
+        mc_log_system_error("Gagal menulis ringkasan resume");
+        return -1;
+    }
+
+    if (fclose(file) != 0) {
+        mc_log_system_error("Gagal menutup checkpoint.info");
+        return -1;
+    }
+
+    return 0;
+}
+
 static int mc_compare_checkpoint_entries(const void *left, const void *right)
 {
     const mc_checkpoint_catalog_entry *left_entry = left;
@@ -751,26 +866,32 @@ static int mc_compare_checkpoint_entries(const void *left, const void *right)
 /*
  * Melepaskan target yang masih ditahan oleh snapshot aktif.
  *
- * Helper ini dipakai saat `dump-memory` selesai dan juga saat program keluar,
- * sehingga perilaku stop/resume target tetap mudah dipahami.
+ * `detach_signal` menentukan sinyal apa yang dikirim saat `PTRACE_DETACH`.
+ * Dengan nilai `0`, target diizinkan lanjut berjalan. Dengan `SIGSTOP`,
+ * target tetap berada dalam keadaan stop sesudah tracer dilepas.
  */
-int mc_release_snapshot(mc_context *ctx, bool announce)
+int mc_release_snapshot(mc_context *ctx, bool announce, int detach_signal)
 {
     if (!ctx->snapshot_active) {
         return 0;
     }
 
-    if (ctx->target_pid > 0 && ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) == -1) {
+    if (ctx->target_pid > 0 &&
+        ptrace(PTRACE_DETACH, ctx->target_pid, NULL, (void *)(long)detach_signal) == -1) {
         if (errno != ESRCH) {
             mc_log_system_error("Gagal melepaskan ptrace dari target");
             return -1;
         }
 
-    if (announce) {
+        if (announce) {
             mc_log_warn("Snapshot aktif dibersihkan, tetapi target sudah tidak tersedia.");
         }
     } else if (announce) {
-        mc_log_info("Target dilepas kembali dan diizinkan berjalan.");
+        if (detach_signal == SIGSTOP) {
+            mc_log_info("Target dilepas dari tracer dan tetap dalam keadaan stop.");
+        } else {
+            mc_log_info("Target dilepas kembali dan diizinkan berjalan.");
+        }
     }
 
     ctx->snapshot_active = false;
@@ -813,6 +934,81 @@ int mc_list_checkpoints(const mc_context *ctx)
     fflush(stdout);
 
     free(entries);
+    return 0;
+}
+
+int mc_resume_checkpoint(mc_context *ctx, const char *reference)
+{
+    mc_checkpoint_catalog_entry entry;
+    char checkpoint_path[PATH_MAX];
+    char process_state = '\0';
+    char message[160];
+
+    if (mc_resolve_checkpoint_reference(ctx, reference, checkpoint_path, sizeof(checkpoint_path)) != 0) {
+        return 1;
+    }
+
+    if (mc_find_checkpoint_catalog_entry(ctx, reference, &entry) != 0) {
+        return 1;
+    }
+
+    if (strcmp(entry.status_snapshot, "aktif_menunggu_dump_memori") != 0) {
+        mc_log_error("Checkpoint ini tidak sedang menahan proses freeze yang bisa di-resume.");
+        return 1;
+    }
+
+    if (ctx->snapshot_active && strcmp(checkpoint_path, ctx->last_checkpoint_dir) == 0) {
+        if (mc_append_resume_summary(checkpoint_path, entry.checkpoint_flag, entry.pid_target) != 0) {
+            return 1;
+        }
+
+        if (mc_release_snapshot(ctx, true, 0) != 0) {
+            return 1;
+        }
+
+        snprintf(message,
+                 sizeof(message),
+                 "Proses asli untuk checkpoint %s sudah dilanjutkan kembali.",
+                 entry.checkpoint_flag);
+        mc_log_ok(message);
+        return 0;
+    }
+
+    if (!mc_process_exists(entry.pid_target)) {
+        mc_log_error("PID target dari checkpoint ini sudah tidak berjalan.");
+        return 1;
+    }
+
+    if (mc_read_process_state(entry.pid_target, &process_state) != 0) {
+        return 1;
+    }
+
+    if (process_state != 'T' && process_state != 't') {
+        mc_log_error("PID target dari checkpoint ini tidak sedang berada dalam keadaan stop.");
+        return 1;
+    }
+
+    if (kill(entry.pid_target, SIGCONT) != 0) {
+        mc_log_system_error("Gagal mengirim SIGCONT ke PID target");
+        return 1;
+    }
+
+    if (mc_append_resume_summary(checkpoint_path, entry.checkpoint_flag, entry.pid_target) != 0) {
+        return 1;
+    }
+
+    if (ctx->target_pid == entry.pid_target && ctx->snapshot_active) {
+        ctx->snapshot_active = false;
+        ctx->active_snapshot_id[0] = '\0';
+        ctx->active_checkpoint_flag[0] = '\0';
+    }
+
+    snprintf(message,
+             sizeof(message),
+             "Proses PID %d untuk checkpoint %s sudah dilanjutkan kembali.",
+             entry.pid_target,
+             entry.checkpoint_flag);
+    mc_log_ok(message);
     return 0;
 }
 

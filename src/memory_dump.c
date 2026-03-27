@@ -682,7 +682,7 @@ cleanup:
      * kembali baik saat berhasil maupun saat terjadi galat agar perilaku resume
      * tetap mudah dipahami.
      */
-    if (mc_release_snapshot(ctx, true) != 0) {
+    if (mc_release_snapshot(ctx, true, 0) != 0) {
         result = 1;
     }
 

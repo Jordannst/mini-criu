@@ -251,7 +251,7 @@ int mc_freeze_target(mc_context *ctx)
      * proses yang sudah tidak ada.
      */
     if (ctx->snapshot_active) {
-        mc_log_error("Masih ada snapshot aktif. Jalankan 'dump-memory' untuk menyelesaikannya atau keluar dari CLI untuk membatalkannya.");
+        mc_log_error("Masih ada snapshot aktif. Gunakan 'dump-memory' untuk menyelesaikannya atau 'resume <flag>' untuk melepas proses aslinya.");
         return 1;
     }
 
@@ -388,8 +388,8 @@ int mc_freeze_target(mc_context *ctx)
     mc_print_kv_text("Flag checkpoint", checkpoint_flag);
     mc_print_kv_text("File", "checkpoint.info, regs.dump");
     mc_print_kv_text("Snapshot aktif", "ya");
-    mc_print_kv_text("Perilaku target", "tetap berhenti sampai dump-memory selesai");
-    mc_log_info("Jika sesi CLI berakhir lebih dulu, target akan dilepas kembali otomatis.");
+    mc_print_kv_text("Perilaku target", "tetap stop sampai dump-memory atau exit");
+    mc_log_info("Jika sesi CLI berakhir lebih dulu, target tetap stop meskipun tracer dilepas.");
     result = 0;
 
 cleanup:
@@ -399,7 +399,7 @@ cleanup:
      */
     if (attached) {
         if (ctx->snapshot_active) {
-            if (mc_release_snapshot(ctx, true) != 0) {
+            if (mc_release_snapshot(ctx, true, 0) != 0) {
                 result = 1;
             }
         } else if (ptrace(PTRACE_DETACH, ctx->target_pid, NULL, NULL) == -1) {

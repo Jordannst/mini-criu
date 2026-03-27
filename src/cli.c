@@ -26,6 +26,9 @@ static mc_command_kind mc_lookup_command(const char *name)
     if (strcmp(name, "list") == 0) {
         return MC_CMD_LIST;
     }
+    if (strcmp(name, "resume") == 0) {
+        return MC_CMD_RESUME;
+    }
     if (strcmp(name, "restore") == 0) {
         return MC_CMD_RESTORE;
     }
@@ -88,6 +91,12 @@ static int mc_parse_tokens(int argc, char **argv, mc_command *cmd)
             return -1;
         }
         break;
+    case MC_CMD_RESUME:
+        if (argc != 2) {
+            cmd->error = "penggunaan: resume <flag_checkpoint>";
+            return -1;
+        }
+        break;
     case MC_CMD_RESTORE:
         if (argc != 2) {
             cmd->error = "penggunaan: restore <flag_checkpoint>";
@@ -109,7 +118,7 @@ void mc_print_banner(void)
 {
     mc_print_section("mini-criu");
     puts("  CLI checkpoint/restore eksperimental untuk proses Linux");
-    puts("  Alur cepat: freeze <pid> -> dump-memory -> list -> restore <flag>");
+    puts("  Alur cepat: freeze <pid> -> dump-memory/exit -> list -> restore/resume <flag>");
 }
 
 /*
@@ -124,6 +133,7 @@ void mc_print_help(void)
     printf("  %-20s %s\n", "freeze <pid>", "Freeze proses dan mulai snapshot");
     printf("  %-20s %s\n", "dump-memory", "Simpan mem.meta dan mem.dump");
     printf("  %-20s %s\n", "list", "Lihat semua checkpoint dengan flag singkat");
+    printf("  %-20s %s\n", "resume <flag>", "Lanjutkan proses asli yang masih freeze");
     printf("  %-20s %s\n", "restore <flag>", "Restore checkpoint berdasarkan flag");
     printf("  %-20s %s\n", "exit", "Keluar dari CLI");
 }
@@ -221,6 +231,8 @@ int mc_execute_command(mc_context *ctx, const mc_command *cmd)
         return mc_dump_memory(ctx);
     case MC_CMD_LIST:
         return mc_list_checkpoints(ctx);
+    case MC_CMD_RESUME:
+        return mc_resume_checkpoint(ctx, cmd->argv[1]);
     case MC_CMD_RESTORE:
         if (mc_resolve_checkpoint_reference(ctx,
                                             cmd->argv[1],

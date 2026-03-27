@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <signal.h>
 #include <sys/types.h>
 
 #ifndef PATH_MAX
@@ -27,6 +28,7 @@ typedef enum {
     MC_CMD_FREEZE,
     MC_CMD_DUMP_MEMORY,
     MC_CMD_LIST,
+    MC_CMD_RESUME,
     MC_CMD_RESTORE,
     MC_CMD_EXIT
 } mc_command_kind;
@@ -90,11 +92,12 @@ void mc_print_kv_size(const char *label, size_t value);
 void mc_print_kv_u64(const char *label, unsigned long long value);
 void mc_print_kv_hex(const char *label, unsigned long long value);
 void mc_print_prompt(void);
-int mc_release_snapshot(mc_context *ctx, bool announce);
+int mc_release_snapshot(mc_context *ctx, bool announce, int detach_signal);
 
 int mc_freeze_target(mc_context *ctx);
 int mc_dump_memory(mc_context *ctx);
 int mc_list_checkpoints(const mc_context *ctx);
+int mc_resume_checkpoint(mc_context *ctx, const char *reference);
 int mc_allocate_checkpoint_flag(const mc_context *ctx,
                                 char *checkpoint_flag,
                                 size_t checkpoint_flag_size);

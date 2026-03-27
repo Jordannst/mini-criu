@@ -32,6 +32,7 @@ Proyek ini belum ditujukan sebagai pengganti CRIU dan belum mencapai restore pro
 - membaca metadata region memori dari `/proc/<pid>/maps`
 - membaca isi memori mentah dari `/proc/<pid>/mem`
 - menampilkan daftar checkpoint yang tersimpan lewat `list`
+- melanjutkan kembali proses asli yang masih freeze lewat `resume <flag_checkpoint>`
 - memuat dan memvalidasi direktori checkpoint
 - membangun rencana restore dari metadata checkpoint
 - membuat proses target restore sementara
@@ -108,6 +109,7 @@ Untuk menjalankan satu command tanpa masuk shell interaktif:
 ./build/mini-criu help
 ./build/mini-criu status
 ./build/mini-criu list
+./build/mini-criu resume F0001
 ./build/mini-criu restore F0001
 ```
 
@@ -118,6 +120,7 @@ Untuk menjalankan satu command tanpa masuk shell interaktif:
 - `freeze <pid>`
 - `dump-memory`
 - `list`
+- `resume <flag_checkpoint>`
 - `restore <flag_checkpoint>`
 - `clear`
 - `/clear`
@@ -138,6 +141,15 @@ Jalankan CLI:
 ```
 
 Contoh alur checkpoint:
+
+```text
+mini-criu> freeze 12345
+mini-criu> exit
+./build/mini-criu resume F0001
+./build/mini-criu list
+```
+
+Contoh melengkapi checkpoint:
 
 ```text
 mini-criu> freeze 12345

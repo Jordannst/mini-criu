@@ -15,10 +15,11 @@ int main(int argc, char **argv)
     status = mc_run_cli(&ctx, argc, argv);
 
     /*
-     * Jika masih ada snapshot aktif saat program berakhir, target harus
-     * dilepas kembali agar tidak tertinggal dalam keadaan stop.
+     * Jika sesi berakhir saat snapshot masih aktif, target dilepas dari tracer
+     * tetapi dibiarkan tetap stop agar kondisi freeze tidak hilang hanya karena
+     * CLI ditutup.
      */
-    if (mc_release_snapshot(&ctx, true) != 0 && status == 0) {
+    if (mc_release_snapshot(&ctx, true, SIGSTOP) != 0 && status == 0) {
         status = 1;
     }
 
