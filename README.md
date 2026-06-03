@@ -1,6 +1,7 @@
 # mini-criu
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/Jordannst/mini-criu/actions/workflows/ci.yml/badge.svg)](https://github.com/Jordannst/mini-criu/actions/workflows/ci.yml)
 [![Language: C](https://img.shields.io/badge/language-C-blue.svg)](#project-structure)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%2F%20WSL-2ea44f.svg)](#build)
 [![Status: Experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#current-status)
