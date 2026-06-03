@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Jordannst/mini-criu/security/policy
+    about: Please review SECURITY.md before sharing sensitive details.

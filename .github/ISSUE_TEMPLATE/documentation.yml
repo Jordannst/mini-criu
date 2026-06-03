@@ -1,0 +1,26 @@
+name: Documentation improvement
+description: Suggest a clearer explanation, example, or project note.
+title: "docs: "
+labels:
+  - documentation
+body:
+  - type: textarea
+    id: section
+    attributes:
+      label: Affected section
+      description: Which document or section should change?
+      placeholder: "README.md / Build / Restore Flow"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is unclear?
+      placeholder: Describe the confusing or missing part.
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested improvement
+      placeholder: Share the wording, example, or structure you would prefer.

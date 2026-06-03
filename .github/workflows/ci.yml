@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and CLI smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          gcc --version
+          make --version
+
+      - name: Build
+        run: make clean && make
+
+      - name: Verify CLI entry points
+        run: |
+          ./build/mini-criu help
+          ./build/mini-criu status

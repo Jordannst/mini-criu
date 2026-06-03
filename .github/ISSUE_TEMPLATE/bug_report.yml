@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a reproducible problem in mini-criu.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please avoid sharing checkpoint artifacts
+        that may contain private process memory.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+      placeholder: Describe the observed behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: List the smallest command sequence that reproduces the issue.
+      placeholder: |
+        1. make clean && make
+        2. ./build/mini-criu
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: What happened instead?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Distro, kernel, architecture, compiler, and whether this is WSL.
+      placeholder: "Ubuntu 24.04, Linux 6.x, x86_64, gcc 13, WSL2"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste sanitized logs only. Do not include private memory dumps.
+      render: text

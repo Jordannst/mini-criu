@@ -1,0 +1,51 @@
+name: Restore diagnostics
+description: Share a restore failure mode or diagnostic trace.
+title: "restore: "
+labels:
+  - restore
+  - diagnostics
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Restore is experimental. Reports are most useful when they include the
+        target type, command sequence, and sanitized diagnostic output.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Target and scope
+      description: What process or demo target were you trying to checkpoint or restore?
+      placeholder: "cpu_bound_target, memory_bound_target, or another local process"
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands used
+      description: Include the exact commands or CLI sequence.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Restore diagnostics
+      description: Paste sanitized restore output. Do not attach raw checkpoint artifacts.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: checkpoint_sensitive
+    attributes:
+      label: Did the checkpoint contain sensitive process data?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "Ubuntu 24.04, Linux 6.x, x86_64, gcc 13, WSL2"
