@@ -4,6 +4,8 @@
 [![Language: C](https://img.shields.io/badge/language-C-blue.svg)](#project-structure)
 [![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%2F%20WSL-2ea44f.svg)](#build)
 [![Status: Experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#current-status)
+[![GitHub stars](https://img.shields.io/github/stars/Jordannst/mini-criu?style=flat&label=stars)](https://github.com/Jordannst/mini-criu/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/Jordannst/mini-criu?style=flat&label=forks)](https://github.com/Jordannst/mini-criu/forks)
 
 `mini-criu` is a small educational Linux checkpoint/restore project written in
 C. It is inspired by CRIU, but intentionally scoped down so the core mechanics
