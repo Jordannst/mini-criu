@@ -1,5 +1,7 @@
 # mini-criu
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 `mini-criu` adalah proyek eksplorasi checkpoint/restore proses Linux berbasis C dengan antarmuka CLI. Proyek ini terinspirasi dari CRIU, tetapi dibuat dalam bentuk yang lebih kecil, lebih mudah dibaca, dan lebih fokus pada pemahaman mekanisme inti seperti `ptrace`, pembacaan metadata memori, dump register, dump memori mentah, dan percobaan restore parsial.
 
 Fokus utama `mini-criu` adalah:
@@ -186,3 +188,7 @@ Direktori checkpoint umumnya berisi:
 ## Status Proyek
 
 `mini-criu` sudah mampu menunjukkan alur checkpoint yang nyata dan alur restore parsial yang cukup informatif untuk dianalisis. Bagian checkpoint sudah konkret dan dapat dipakai, sedangkan bagian restore masih berfokus pada penyiapan, percobaan resume, dan diagnosis titik gagal yang tersisa.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
