@@ -71,6 +71,20 @@ Beberapa keterbatasan penting yang masih ada:
 - restore multithreading belum ada
 - perilaku restore masih bersifat eksploratif, belum production-grade
 
+## Security and Scope
+
+`mini-criu` touches sensitive Linux internals such as `ptrace`, `/proc/<pid>/mem`, raw memory dumps, register state, and process control. Use it only on processes and machines you own or are authorized to inspect.
+
+Security expectations for this project:
+
+- checkpoint artifacts may contain private process memory and should be treated as sensitive
+- restore should fail closed outside the documented demo scope
+- untrusted checkpoint artifacts are not supported
+- the binary should not be installed as setuid or exposed as a remote service
+- this project is for education and experimentation, not production isolation
+
+For vulnerability reporting and detailed security boundaries, see [SECURITY.md](SECURITY.md).
+
 ## Build
 
 Bangun CLI dan target contoh dengan:
