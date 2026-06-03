@@ -1,6 +1,9 @@
 # mini-criu
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Language: C](https://img.shields.io/badge/language-C-blue.svg)](#project-structure)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%2F%20WSL-2ea44f.svg)](#build)
+[![Status: Experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#current-status)
 
 `mini-criu` is a small educational Linux checkpoint/restore project written in
 C. It is inspired by CRIU, but intentionally scoped down so the core mechanics
@@ -18,6 +21,45 @@ The project focuses on practical low-level pieces behind checkpoint/restore:
 `mini-criu` is not a CRIU replacement. The checkpoint path is concrete, while
 restore is still experimental and focused on diagnosis rather than full Linux
 process recovery.
+
+> [!NOTE]
+> This repository is built as a readable systems-learning project. It aims to
+> expose real checkpoint/restore mechanics without claiming production-grade
+> process recovery.
+
+> [!WARNING]
+> Checkpoint artifacts may contain private process memory. Do not run
+> `mini-criu` against processes or machines you do not own or have permission
+> to inspect.
+
+## At a Glance
+
+| Area | Current state |
+| --- | --- |
+| Language | C |
+| Platform | Linux / WSL |
+| Interface | Interactive CLI and one-shot commands |
+| Checkpoint | Concrete register and selected-memory dump flow |
+| Restore | Experimental partial restore with controlled resume diagnostics |
+| Safety stance | Narrow scope, explicit limitations, fail-closed expectations |
+| License | MIT |
+
+## Contents
+
+- [Why This Exists](#why-this-exists)
+- [Current Status](#current-status)
+- [What Works Today](#what-works-today)
+- [Restore Flow](#restore-flow)
+- [Limitations](#limitations)
+- [Security and Scope](#security-and-scope)
+- [Build](#build)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+- [Project Structure](#project-structure)
+- [Validation](#validation)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Why This Exists
 
@@ -103,6 +145,10 @@ explicitly and remain clear about what is supported.
 `/proc/<pid>/mem`, raw memory dumps, register state, and process control. Use
 it only on processes and machines you own or are authorized to inspect.
 
+> [!IMPORTANT]
+> Treat checkpoints like sensitive artifacts. A memory dump can include stack
+> data, paths, environment values, and other private runtime state.
+
 Security expectations:
 
 - checkpoint artifacts may contain private process memory
@@ -135,6 +181,32 @@ Clean build artifacts:
 ```bash
 make clean
 ```
+
+## Quick Start
+
+```bash
+make clean && make
+./build/targets/cpu_bound_target
+```
+
+In a second terminal:
+
+```bash
+./build/mini-criu
+```
+
+Inside the CLI:
+
+```text
+mini-criu> freeze <pid>
+mini-criu> dump-memory
+mini-criu> list
+mini-criu> resume F0001
+```
+
+> [!TIP]
+> Use `list` after a checkpoint to find the short checkpoint flag, such as
+> `F0001`, before running `resume` or `restore`.
 
 ## Usage
 
