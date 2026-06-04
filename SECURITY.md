@@ -37,6 +37,26 @@ Please keep these boundaries in mind when using or contributing to the project:
 - Prefer explicit validation and fail-closed errors over permissive best-effort
   restore behavior.
 
+## Sensitive Checkpoint Artifact Examples
+
+Checkpoint artifacts can expose more than obvious program output. Treat the
+following as sensitive and avoid posting them publicly unless they are
+intentionally sanitized:
+
+- raw `mem.dump` contents
+- stack bytes or stack-derived diagnostics from real workloads
+- environment values captured from process memory
+- local filesystem paths, usernames, home directories, or project paths
+- process arguments or runtime configuration values
+- application secrets, tokens, session data, or API keys that may appear in
+  memory
+- `checkpoint.info`, `regs.dump`, or `mem.meta` files from private workloads
+- restore logs that include private paths, addresses tied to a real workload,
+  or unsanitized process details
+
+For public issues, prefer a small synthetic target and paste only the minimal
+sanitized diagnostic output needed to explain the problem.
+
 ## Reporting a Vulnerability
 
 If you find a security issue, please avoid opening a public issue with exploit
