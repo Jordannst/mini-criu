@@ -55,6 +55,7 @@ process recovery.
 - [Restore Flow](#restore-flow)
 - [Limitations](#limitations)
 - [Security and Scope](#security-and-scope)
+- [Supported Environment](#supported-environment)
 - [Build](#build)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
@@ -164,6 +165,39 @@ Security expectations:
 
 For vulnerability reporting and detailed security boundaries, see
 [SECURITY.md](SECURITY.md).
+
+## Supported Environment
+
+`mini-criu` is developed for Linux-like environments where `ptrace` and
+`/proc/<pid>/mem` are available.
+
+Known and expected targets:
+
+| Requirement | Notes |
+| --- | --- |
+| OS | Linux or WSL2 |
+| Architecture | `x86_64` |
+| Toolchain | `gcc`, `make`, POSIX shell utilities |
+| Permissions | Ability to inspect the target process with `ptrace` and read `/proc/<pid>/mem` |
+| CI baseline | GitHub Actions `ubuntu-latest` builds the project with `make clean && make` |
+
+> [!NOTE]
+> The CI build verifies compilation and basic CLI entry points. Manual
+> checkpoint/restore testing still requires a local Linux or WSL environment
+> because it interacts with live process state.
+
+Common environment issues:
+
+- `ptrace` attach can fail with `EPERM` if the target process is not owned by
+  the same user or if the system restricts process inspection.
+- On some Linux distributions, Yama `ptrace_scope` settings restrict attaching
+  to unrelated processes even when they share the same user.
+- `/proc/<pid>/mem` access depends on successful process inspection permissions.
+- WSL behavior can differ from a full Linux installation, especially around
+  process inspection and kernel-level behavior.
+- Running against system services, protected processes, or processes owned by
+  another user is unsupported unless you intentionally provide the required
+  privileges.
 
 ## Build
 
