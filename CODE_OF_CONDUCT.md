@@ -29,7 +29,7 @@ respectful, technical, and welcoming.
 For conduct concerns, contact the maintainer privately:
 
 ```text
-keezmisz@gmail.com
+jordannst.08@gmail.com
 ```
 
 For security issues, follow [SECURITY.md](SECURITY.md).
