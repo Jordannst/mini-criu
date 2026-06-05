@@ -64,7 +64,7 @@ details. Use GitHub private vulnerability reporting if it is available on this
 repository. If not, contact the maintainer privately at:
 
 ```text
-keezmisz@gmail.com
+jordannst.08@gmail.com
 ```
 
 Useful reports include:
