@@ -40,6 +40,7 @@ Run the smallest relevant check before opening a PR:
 
 ```bash
 make clean && make
+bash scripts/smoke_cli.sh
 ```
 
 If additional smoke or restore tests exist in your branch, run the relevant

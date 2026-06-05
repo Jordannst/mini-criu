@@ -29,6 +29,4 @@ jobs:
         run: make clean && make
 
       - name: Verify CLI entry points
-        run: |
-          ./build/mini-criu help
-          ./build/mini-criu status
+        run: bash scripts/smoke_cli.sh

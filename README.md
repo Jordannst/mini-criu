@@ -179,7 +179,7 @@ Known and expected targets:
 | Architecture | `x86_64` |
 | Toolchain | `gcc`, `make`, POSIX shell utilities |
 | Permissions | Ability to inspect the target process with `ptrace` and read `/proc/<pid>/mem` |
-| CI baseline | GitHub Actions `ubuntu-latest` builds the project with `make clean && make` |
+| CI baseline | GitHub Actions `ubuntu-latest` builds the project and runs `scripts/smoke_cli.sh` |
 
 > [!NOTE]
 > The CI build verifies compilation and basic CLI entry points. Manual
@@ -335,6 +335,7 @@ At minimum, verify that the project builds:
 
 ```bash
 make clean && make
+bash scripts/smoke_cli.sh
 ```
 
 Because restore touches process state and raw memory, manual testing should be
